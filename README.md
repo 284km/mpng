@@ -26,12 +26,19 @@ Filters operate on *bytes*, so a 16-bit sample means `left` is two bytes further
 back. That distinction decodes 8-bit images perfectly and 16-bit ones into noise
 if you get it wrong, which is why there are 16-bit cases in the tests.
 
-`mpng encode` writes 8-bit PNGs, making the two decisions an encoder has to. A
-**filter per scanline**, the way the spec suggests: try all five, keep the one whose
-bytes have the smallest absolute sum, because DEFLATE does better on numbers near
-zero. And a **colour type**: grey when every pixel is grey, which is a third of the
-samples. PNG's colour types are not a description of the data but a claim about it,
-and the cheapest true claim is the right one. Compression is `mgz`'s
+`mpng encode` writes PNGs, making the two decisions an encoder has to. A **filter
+per scanline**, the way the spec suggests: try all five, keep the one whose bytes
+have the smallest absolute sum, because DEFLATE does better on numbers near zero.
+And a **colour type** — grey when every pixel is grey, a **palette** when there are
+at most 256 distinct colours, RGB when there are more. PNG's colour types are not a
+description of the data but a claim about it, and the cheapest true claim is the
+right one; the first two are a third of the samples of the last.
+
+Depth comes from the input rather than a flag: a PPM with `maxval 65535` carries
+two bytes a sample, big-endian, which is the order PNG uses — so the bytes pass
+through and only the header changes. Grey and palette are not offered at 16 bits,
+because both are decisions about 8-bit samples and guessing at the other depth
+would be inventing a claim. Compression is `mgz`'s
 deflate, the chunk CRCs are `mgz`'s crc32, and the zlib Adler-32 is here — a PNG
 carries two different checksums and they are not interchangeable.
 

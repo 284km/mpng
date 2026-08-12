@@ -105,15 +105,24 @@ let encode_cmd = fn (path: str) -> fn (out: str) ->
   else
     let width = vec_get f 0 in
     let height = vec_get f 1 in
+    let maxval = vec_get f 2 in
     let start = vec_get f 3 in
+    // A PPM with maxval 65535 carries two bytes a sample, big-endian — the same
+    // order PNG uses, so the bytes go through untouched and only the header has
+    // to say 16.
+    let wide = maxval > 255 in
+    let bytes_per_sample = if wide then 2 else 1 in
     let pixels = vec_new () in
     let rec copy = fn (i: int) ->
-      if i >= width * height * 3 then ()
+      if i >= width * height * 3 * bytes_per_sample then ()
       else let _ = vec_push pixels (vec_get data (start + i)) in copy (i + 1) in
     let _ = copy 0 in
-    let png = bytes_of_vec (encode_rgb8 pixels width height) in
+    let png =
+      bytes_of_vec (if wide then encode16 pixels width height
+                    else encode_rgb8 pixels width height) in
     let _ = write_bytes out png in
-    print (str_of_int width ++ "x" ++ str_of_int height ++ " -> " ++ out
+    print (str_of_int width ++ "x" ++ str_of_int height ++ " "
+           ++ str_of_int (if wide then 16 else 8) ++ "-bit -> " ++ out
            ++ " (" ++ str_of_int (bytes_len png) ++ " bytes)");
 
 let main = fn () ->

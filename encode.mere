@@ -130,11 +130,56 @@ let all_grey = fn pixels -> fn (n: int) ->
       then go (i + 1) else false in
   go 0;
 
-// A complete PNG: 8 bits a sample, no interlacing, one IDAT — grey when the
-// pixels are grey, RGB otherwise.
-let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
-  let grey = all_grey pixels (width * height) in
-  let bpp = if grey then 1 else 3 in
+// The distinct colours, up to 257 of them — the moment there are more than 256 the
+// answer is "too many" and counting further is wasted. Returned flat as r,g,b
+// triples, which is also exactly the PLTE chunk's format.
+//
+// A linear scan per pixel, which is O(pixels x colours). That is fine at 256
+// colours and would not be at 2^24; the early exit is what keeps it honest.
+let collect_palette = fn pixels -> fn (n: int) ->
+  let pal = vec_new () in
+  let rec go = fn (i: int) ->
+    if i >= n || vec_len pal > 768 then pal
+    else
+      let p = i * 3 in
+      let r = vec_get pixels p in
+      let g = vec_get pixels (p + 1) in
+      let b = vec_get pixels (p + 2) in
+      let rec seen = fn (k: int) ->
+        if k >= vec_len pal then false
+        else if vec_get pal k == r && vec_get pal (k + 1) == g
+                && vec_get pal (k + 2) == b then true
+        else seen (k + 3) in
+      let _ =
+        if seen 0 then ()
+        else
+          let _ = vec_push pal r in
+          let _ = vec_push pal g in
+          vec_push pal b in
+      go (i + 1) in
+  go 0;
+
+let palette_index = fn pal -> fn (r: int) -> fn (g: int) -> fn (b: int) ->
+  let rec go = fn (k: int) ->
+    if k >= vec_len pal then 0
+    else if vec_get pal k == r && vec_get pal (k + 1) == g
+            && vec_get pal (k + 2) == b then k / 3
+    else go (k + 3) in
+  go 0;
+
+// A complete PNG: 8 bits a sample, no interlacing, one IDAT. The colour type is
+// the cheapest true claim about the pixels — grey if they are all grey, a palette
+// if there are at most 256 distinct colours, RGB otherwise. All three are one
+// byte per pixel except the last, which is three.
+let encode_at_depth = fn pixels -> fn (width: int) -> fn (height: int) -> fn (depth: int) ->
+  let count = width * height in
+  let eight = depth == 8 in
+  let grey = eight && all_grey pixels count in
+  // Only worth asking when the image is not already grey: grey is one byte a
+  // pixel too, and needs no palette chunk.
+  let pal = if grey || eight == false then vec_new () else collect_palette pixels count in
+  let indexed = grey == false && eight && vec_len pal <= 768 && vec_len pal > 0 in
+  let bpp = if grey || indexed then 1 else if eight then 3 else 6 in
   let stride = width * bpp in
   // The filtered scanlines, which is what gets compressed.
   let raw = vec_new () in
@@ -145,10 +190,15 @@ let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
       let rec col = fn (x: int) ->
         if x == stride then ()
         else
-          // In grey, one sample per pixel: take the red channel, which the check
-          // above proved is the whole story.
-          let src = if grey then (y * width + x) * 3 else y * stride + x in
-          let _ = vec_push row (vec_get pixels src) in
+          // One sample per pixel in grey (the red channel, which the check above
+          // proved is the whole story) and in palette (the index).
+          let _ =
+            if grey then vec_push row (vec_get pixels ((y * width + x) * 3))
+            else if indexed then
+              let p = (y * width + x) * 3 in
+              vec_push row (palette_index pal (vec_get pixels p)
+                              (vec_get pixels (p + 1)) (vec_get pixels (p + 2)))
+            else vec_push row (vec_get pixels (y * stride + x)) in
           col (x + 1) in
       let _ = col 0 in
       let _ = push_all raw (best_filter row prev bpp) in
@@ -179,12 +229,25 @@ let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
   let ihdr = vec_new () in
   let _ = bytes_push4be ihdr width in
   let _ = bytes_push4be ihdr height in
-  let _ = vec_push ihdr 8 in     // bit depth
-  let _ = vec_push ihdr (if grey then 0 else 2) in     // colour type
+  let _ = vec_push ihdr depth in  // bit depth
+  let _ = vec_push ihdr (if grey then 0 else if indexed then 3 else 2) in  // colour type
   let _ = vec_push ihdr 0 in     // compression: deflate, the only one
   let _ = vec_push ihdr 0 in     // filter method: the five above, the only set
   let _ = vec_push ihdr 0 in     // interlace: none
   let _ = chunk out 73 72 68 82 ihdr in
+  // PLTE has to come before the first IDAT, which is the one ordering rule here.
+  let _ = if indexed then chunk out 80 76 84 69 pal else () in
   let _ = chunk out 73 68 65 84 z in
   let _ = chunk out 73 69 78 68 (vec_new ()) in
   out;
+
+let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
+  encode_at_depth pixels width height 8;
+
+// `depth` is 8 or 16. At 16 the samples in `pixels` are already pairs of bytes,
+// big-endian as PNG stores them, so this only has to say so in the header and let
+// the filters work in bytes — which they always did, since `bpp` is a byte count.
+// Grey and palette are not offered at 16 bits: both are decisions about 8-bit
+// samples, and guessing at the other depth would be inventing a claim.
+let encode16 = fn pixels -> fn (width: int) -> fn (height: int) ->
+  encode_at_depth pixels width height 16;

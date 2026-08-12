@@ -138,6 +138,73 @@ else
   fail=$((fail + 1))
 fi
 
+# The colour type the encoder picks is a claim about the pixels, and the cheapest
+# true one is the right one: grey when they are grey, a palette when there are at
+# most 256 colours, RGB when there are more.
+python3 - "$TMP" <<'PAL'
+import sys
+d = sys.argv[1]
+w, h = 16, 8
+few = bytearray()
+for y in range(h):
+    for x in range(w):
+        few += bytes([(0, 0, 0), (255, 0, 0), (0, 128, 255), (9, 200, 7)][(x + y) % 4])
+open(d + "/few.ppm", "wb").write(b"P6\n%d %d\n255\n" % (w, h) + bytes(few))
+# More than 256 distinct colours, so the palette must be declined.
+w2, h2 = 32, 20
+many = bytearray()
+for y in range(h2):
+    for x in range(w2):
+        many += bytes([(x * 8) % 256, (y * 13) % 256, (x * y) % 256])
+open(d + "/many.ppm", "wb").write(b"P6\n%d %d\n255\n" % (w2, h2) + bytes(many))
+PAL
+"$MERE" "$DIR/mpng.mere" encode "$TMP/few.ppm" "$TMP/few.png" > /dev/null
+"$MERE" "$DIR/mpng.mere" ppm "$TMP/few.png" "$TMP/few2.ppm" > /dev/null
+if "$MERE" "$DIR/mpng.mere" info "$TMP/few.png" | grep -q palette \
+   && cmp -s "$TMP/few.ppm" "$TMP/few2.ppm"; then
+  printf '  ok    four colours become a palette, and survive the trip\n'
+  pass=$((pass + 1))
+else
+  printf '  FAIL  the palette case\n'
+  fail=$((fail + 1))
+fi
+"$MERE" "$DIR/mpng.mere" encode "$TMP/many.ppm" "$TMP/many.png" > /dev/null
+"$MERE" "$DIR/mpng.mere" ppm "$TMP/many.png" "$TMP/many2.ppm" > /dev/null
+if "$MERE" "$DIR/mpng.mere" info "$TMP/many.png" | grep -q rgb \
+   && cmp -s "$TMP/many.ppm" "$TMP/many2.ppm"; then
+  printf '  ok    too many colours stays RGB, and survives the trip\n'
+  pass=$((pass + 1))
+else
+  printf '  FAIL  the too-many-colours case\n'
+  fail=$((fail + 1))
+fi
+
+# 16-bit: a PPM with maxval 65535 carries two bytes a sample, big-endian, which is
+# the order PNG uses — so the bytes pass through and only the header changes. The
+# decoder reduces to the high byte on the way out, so that is what to compare.
+python3 - "$TMP" <<'WIDE'
+import struct, sys
+d = sys.argv[1]
+w, h = 5, 4
+px = b"".join(struct.pack(">HHH", (x * 4001) % 65536, (y * 9001) % 65536, 300)
+              for y in range(h) for x in range(w))
+open(d + "/wide.ppm", "wb").write(b"P6\n%d %d\n65535\n" % (w, h) + px)
+open(d + "/wide.expected", "wb").write(
+    b"P6\n%d %d\n255\n" % (w, h)
+    + bytes(v >> 8 for y in range(h) for x in range(w)
+            for v in ((x * 4001) % 65536, (y * 9001) % 65536, 300)))
+WIDE
+"$MERE" "$DIR/mpng.mere" encode "$TMP/wide.ppm" "$TMP/wide.png" > /dev/null
+"$MERE" "$DIR/mpng.mere" ppm "$TMP/wide.png" "$TMP/wide8.ppm" > /dev/null
+if "$MERE" "$DIR/mpng.mere" info "$TMP/wide.png" | grep -q "16-bit" \
+   && cmp -s "$TMP/wide8.ppm" "$TMP/wide.expected"; then
+  printf '  ok    a 16-bit PPM encodes as 16-bit, and decodes to its high bytes\n'
+  pass=$((pass + 1))
+else
+  printf '  FAIL  the 16-bit encode case\n'
+  fail=$((fail + 1))
+fi
+
 # The backends have to agree. They did not, once: writing the PPM through
 # `print_no_nl` dropped every zero byte in the compiled backends and kept them in
 # the interpreter, so the same image decoded to two different files. Nothing but

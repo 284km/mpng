@@ -1,0 +1,168 @@
+// encode.mere — writing PNG.
+//
+// The reverse of png.mere, and the half that has to *choose* something: a PNG
+// encoder picks a filter per scanline, and the choice is what separates a file
+// that compresses from one that does not. The rule here is the one the spec
+// suggests and everybody uses — try all five, keep the one whose filtered bytes
+// have the smallest absolute sum, on the reasoning that DEFLATE does better on
+// numbers near zero.
+//
+// Compression is mgz's `deflate_dynamic`, wrapped in zlib: two bytes of header,
+// the DEFLATE stream, and an Adler-32 of the *unfiltered* input. Chunk CRCs are
+// mgz's `crc32_vec`. Nothing here reimplements either.
+//
+// Exports:
+//   encode_rgb8  pixels width height -> vec   a complete PNG file
+
+import "mgz/deflate.mere";
+
+let bytes_push4be = fn out -> fn (v: int) ->
+  let _ = vec_push out (bit_and (bit_shr v 24) 255) in
+  let _ = vec_push out (bit_and (bit_shr v 16) 255) in
+  let _ = vec_push out (bit_and (bit_shr v 8) 255) in
+  vec_push out (bit_and v 255);
+
+let push_all = fn out -> fn src ->
+  let n = vec_len src in
+  let rec go = fn (i: int) ->
+    if i == n then () else let _ = vec_push out (vec_get src i) in go (i + 1) in
+  go 0;
+
+// Adler-32 (RFC 1950): zlib's checksum, over the uncompressed data. Not CRC-32 —
+// a PNG carries both, one per zlib stream and one per chunk, and they are
+// different algorithms.
+let adler32 = fn data ->
+  let n = vec_len data in
+  let rec go = fn (i: int) -> fn (a: int) -> fn (b: int) ->
+    if i == n then b * 65536 + a
+    else
+      let a2 = (a + vec_get data i) % 65521 in
+      go (i + 1) a2 ((b + a2) % 65521) in
+  go 0 1 0;
+
+// A chunk: length, type, data, CRC over type+data.
+let chunk = fn out -> fn (t0: int) -> fn (t1: int) -> fn (t2: int) -> fn (t3: int) -> fn body ->
+  let _ = bytes_push4be out (vec_len body) in
+  let tagged = vec_new () in
+  let _ = vec_push tagged t0 in
+  let _ = vec_push tagged t1 in
+  let _ = vec_push tagged t2 in
+  let _ = vec_push tagged t3 in
+  let _ = push_all tagged body in
+  let _ = push_all out tagged in
+  bytes_push4be out (crc32_vec tagged);
+
+let paeth_e = fn (a: int) -> fn (b: int) -> fn (c: int) ->
+  let p = a + b - c in
+  let pa = if p >= a then p - a else a - p in
+  let pb = if p >= b then p - b else b - p in
+  let pc = if p >= c then p - c else c - p in
+  if pa <= pb && pa <= pc then a
+  else if pb <= pc then b
+  else c;
+
+// One filtered scanline, for a given filter type. `line` and `prev` are the
+// unfiltered bytes; `prev` is empty for the first row.
+//
+// The parameter is `line` and not `row` for a reason that is not style: with
+// three functions in this file taking a parameter called `row`, the C backend's
+// inner-function lifting left `row` out of this one's capture list and emitted a
+// body referring to an identifier it never declared. See PAIN.md P6. Renaming it
+// is a workaround for a bug in name-keyed capture resolution, not a preference.
+let filter_row = fn (kind: int) -> fn line -> fn prev -> fn (bpp: int) ->
+  let n = vec_len line in
+  let out = vec_new () in
+  let rec go = fn (i: int) ->
+    if i == n then out
+    else
+      let cur = vec_get line i in
+      let left = if i >= bpp then vec_get line (i - bpp) else 0 in
+      let up = if vec_len prev > 0 then vec_get prev i else 0 in
+      let upleft = if vec_len prev > 0 && i >= bpp then vec_get prev (i - bpp) else 0 in
+      let v =
+        if kind == 0 then cur
+        else if kind == 1 then cur - left
+        else if kind == 2 then cur - up
+        else if kind == 3 then cur - (left + up) / 2
+        else cur - paeth_e left up upleft in
+      let _ = vec_push out (bit_and v 255) in
+      go (i + 1) in
+  go 0;
+
+// How unpromising a filtered row looks: bytes are treated as signed, because a
+// byte of 255 is a difference of -1 and cheap, not a large number.
+let row_cost = fn row ->
+  let n = vec_len row in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == n then acc
+    else
+      let b = vec_get row i in
+      go (i + 1) (acc + (if b < 128 then b else 256 - b)) in
+  go 0 0;
+
+// The best of the five, by that measure.
+let best_filter = fn row -> fn prev -> fn (bpp: int) ->
+  let rec go = fn (kind: int) -> fn (bk: int) -> fn (bc: int) -> fn best ->
+    if kind == 5 then
+      let out = vec_new () in
+      let _ = vec_push out bk in
+      let _ = push_all out best in
+      out
+    else
+      let cand = filter_row kind row prev bpp in
+      let c = row_cost cand in
+      if c < bc then go (kind + 1) kind c cand else go (kind + 1) bk bc best in
+  let first = filter_row 0 row prev bpp in
+  go 1 0 (row_cost first) first;
+
+// A complete PNG: 8-bit RGB, no interlacing, one IDAT.
+let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
+  let bpp = 3 in
+  let stride = width * bpp in
+  // The filtered scanlines, which is what gets compressed.
+  let raw = vec_new () in
+  let rec rows = fn (y: int) -> fn prev ->
+    if y == height then ()
+    else
+      let row = vec_new () in
+      let rec col = fn (x: int) ->
+        if x == stride then ()
+        else let _ = vec_push row (vec_get pixels (y * stride + x)) in col (x + 1) in
+      let _ = col 0 in
+      let _ = push_all raw (best_filter row prev bpp) in
+      rows (y + 1) row in
+  let _ = rows 0 (vec_new ()) in
+
+  // zlib: 0x78 0x01 is "deflate, 32K window, no preset dictionary", the header
+  // every encoder writes; then the stream; then Adler-32 of the *unfiltered*
+  // bytes... of the filtered scanlines, which is what was compressed.
+  let z = vec_new () in
+  let _ = vec_push z 0x78 in
+  let _ = vec_push z 0x01 in
+  let _ = push_all z (deflate_dynamic raw) in
+  let _ = bytes_push4be z (adler32 raw) in
+
+  let out = vec_new () in
+  let _ = push_all out (let sig = vec_new () in
+                        let rec go = fn i ->
+                          if i >= 8 then sig
+                          else
+                            let b = if i == 0 then 137 else if i == 1 then 80
+                                    else if i == 2 then 78 else if i == 3 then 71
+                                    else if i == 4 then 13 else if i == 5 then 10
+                                    else if i == 6 then 26 else 10 in
+                            let _ = vec_push sig b in
+                            go (i + 1) in
+                        go 0) in
+  let ihdr = vec_new () in
+  let _ = bytes_push4be ihdr width in
+  let _ = bytes_push4be ihdr height in
+  let _ = vec_push ihdr 8 in     // bit depth
+  let _ = vec_push ihdr 2 in     // colour type: RGB
+  let _ = vec_push ihdr 0 in     // compression: deflate, the only one
+  let _ = vec_push ihdr 0 in     // filter method: the five above, the only set
+  let _ = vec_push ihdr 0 in     // interlace: none
+  let _ = chunk out 73 72 68 82 ihdr in
+  let _ = chunk out 73 68 65 84 z in
+  let _ = chunk out 73 69 78 68 (vec_new ()) in
+  out;

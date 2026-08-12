@@ -68,7 +68,68 @@ let new_vec = fn (n: int) -> fn (x: int) -> ...
 middle of a buffer. This is the fourth dogfood in this project to open with those
 four lines (`memu`, `mkv`, `mgz`, this one).
 
-## What went well, and is worth saying
+## P5 — the C backend emits a closure type name it never defines
+
+Twelve lines:
+
+```mere
+let f = fn data ->
+  let rec go = fn (i: int) -> fn (a: int) -> fn (b: int) -> fn (c: int) -> fn acc ->
+    if i >= 3 then acc
+    else
+      let _ = vec_push acc (vec_get data i + a + b + c) in
+      go (i + 1) a b c acc in
+  go 0 1 2 3 (vec_new ());
+let v = vec_new ();
+let _ = vec_push v 5;
+let _ = vec_push v 6;
+let _ = vec_push v 7;
+let _ = print_int (vec_get (f v) 0);
+```
+
+Runs on the interpreter. `mere -c` emits C that clang refuses:
+
+```
+error: unknown type name
+  'closure_int_closure_int_closure_int_closure_Vec_int_int_Vec_int_int';
+did you mean 'closure_int_closure_int_closure_int_closure_Vec___heap_int_unit'?
+```
+
+Both names come from the same mangler, so the *types* differ: the one in the
+forward declaration contains `Vec_int` — a `Vec` with one type argument — while
+`Vec` is internally two, a region marker and an element (`Vec___heap_int`). So
+something on the inner-function lifting path is building a `Vec` type that has
+lost its region, and only the declaration sees it.
+
+An inner `let rec` with five curried parameters ending in a vec is what triggers
+it; the same shape at top level is fine, and so is the same arity without a vec.
+
+The workaround is to capture the accumulator instead of threading it through the
+recursion, which is better code anyway — it is a mutable buffer, not a value being
+passed along. `read_ppm` in `mpng.mere` says so where it does it.
+
+## P6 — a lifted inner function loses a capture when the name is used elsewhere
+
+Found immediately after P5, in the same file. `filter_row` takes a parameter
+called `row`; so do `row_cost` and `best_filter`, and `encode_rgb8` has a local
+called `row`. With four of them, the C backend lifted `filter_row`'s inner `go`
+with a capture list of *five* variables and left out `row` — then emitted a body
+that reads `mu_row`:
+
+```
+error: use of undeclared identifier 'mu_row'
+```
+
+Renaming the parameter to `line` fixes it, which is what identifies the cause:
+capture resolution is keyed by name, and four `row`s in one file are enough to
+confuse it. This is the same family as the 2048 dogfood's P3 (nested fns with the
+same name colliding in name-keyed lift resolution), which was fixed by α-renaming
+inner fns — evidently *parameters* of sibling functions were not covered.
+
+Both of these were found by `CC_CHECK=1`, which compiles the program and runs the
+result. Neither is visible on the interpreter, and neither is visible from reading
+the emitted C without a compiler.
+\n## What went well, and is worth saying
 
 **`mgz` as a package worked on the first try.** `mere install` fetched it at a
 pinned revision, and `import "mgz/inflate.mere"` resolved — zlib is DEFLATE with

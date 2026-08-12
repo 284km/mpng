@@ -52,9 +52,10 @@ def filter_scanline(kind, row, prev, bpp):
     return bytes([kind]) + bytes(out)
 
 
-def write_png(path, width, height, colour, pixels, filters, split_idat=False):
-    """`pixels` is a list of rows, each a list of channel values."""
-    bpp = {0: 1, 2: 3, 6: 4}[colour]
+def write_png(path, width, height, colour, pixels, filters, split_idat=False,
+              depth=8, plte=None):
+    """`pixels` is a list of rows, each a list of channel values (bytes)."""
+    bpp = bytes_per_pixel(colour, depth)
     raw = b""
     prev = None
     for y, row in enumerate(pixels):
@@ -69,7 +70,8 @@ def write_png(path, width, height, colour, pixels, filters, split_idat=False):
     )
     png = (
         b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, colour, 0, 0, 0))
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, depth, colour, 0, 0, 0))
+        + (chunk(b"PLTE", plte) if plte else b"")
         + idats
         + chunk(b"IEND", b"")
     )
@@ -78,36 +80,50 @@ def write_png(path, width, height, colour, pixels, filters, split_idat=False):
     return raw
 
 
+def bytes_per_pixel(colour, depth):
+    return {0: 1, 2: 3, 3: 1, 6: 4}[colour] * (2 if depth == 16 else 1)
+
+
 def expected_path(path):
     return path + ".expected"
 
 
-def write_expected(path, width, height, colour, pixels):
-    """The PPM mpng should produce: alpha dropped, grey expanded to three."""
-    bpp = {0: 1, 2: 3, 6: 4}[colour]
+def write_expected(path, width, height, colour, pixels, depth=8, plte=None):
+    """The PPM mpng should produce: alpha dropped, grey expanded to three, a
+    palette index looked up, and a 16-bit sample reduced to its high byte —
+    which is what the high byte of a big-endian sample means."""
+    bpp = bytes_per_pixel(colour, depth)
+    step = 2 if depth == 16 else 1
     out = bytearray(f"P6\n{width} {height}\n255\n".encode())
     for row in pixels:
         for x in range(width):
             p = row[x * bpp : (x + 1) * bpp]
-            if bpp == 1:
+            if colour == 3:
+                e = p[0] * 3
+                out += bytes(plte[e : e + 3]) if e + 3 <= len(plte) else b"\0\0\0"
+            elif colour in (0, 4):
                 out += bytes([p[0], p[0], p[0]])
             else:
-                out += bytes(p[:3])
+                out += bytes([p[0], p[step], p[step * 2]])
     with open(expected_path(path), "wb") as f:
         f.write(out)
 
 
-def case(outdir, name, width, height, colour, filters, split_idat=False):
-    bpp = {0: 1, 2: 3, 6: 4}[colour]
+def case(outdir, name, width, height, colour, filters, split_idat=False,
+         depth=8, plte=None):
+    bpp = bytes_per_pixel(colour, depth)
     # Something with structure in both directions, so a filter that reads the
     # wrong neighbour produces a wrong answer rather than the same one.
     pixels = [
         [((x * 37 + y * 11 + c * 53) % 256) for x in range(width) for c in range(bpp)]
         for y in range(height)
     ]
+    if colour == 3:
+        # Indices have to be inside the palette, so they are taken modulo it.
+        pixels = [[v % (len(plte) // 3) for v in row] for row in pixels]
     path = os.path.join(outdir, name)
-    write_png(path, width, height, colour, pixels, filters, split_idat)
-    write_expected(path, width, height, colour, pixels)
+    write_png(path, width, height, colour, pixels, filters, split_idat, depth, plte)
+    write_expected(path, width, height, colour, pixels, depth, plte)
     return path
 
 
@@ -126,6 +142,29 @@ def main():
     # The zlib stream split across two chunks: a decoder that inflates each IDAT
     # separately passes every test above and fails this one.
     made.append(case(outdir, "rgb_split_idat.png", 10, 8, 2, [0, 1, 2, 3, 4], True))
+    # A palette: the pixels are indices, so a decoder that forgets to look them
+    # up produces an image that is the right size and the wrong colours.
+    plte = bytes([(i * 17) % 256 for i in range(6 * 3)])
+    made.append(case(outdir, "palette.png", 5, 4, 3, [0, 1, 2, 3, 4], plte=plte))
+    # 16-bit samples: two bytes each, so the filters step two bytes further back.
+    # This decodes as noise if `left` is computed in samples instead of bytes.
+    made.append(case(outdir, "rgb16_mixed.png", 6, 4, 2, [0, 1, 2, 3, 4], depth=16))
+    made.append(case(outdir, "grey16_mixed.png", 5, 3, 0, [0, 1, 2, 3, 4], depth=16))
+    # A file that must be *refused*, not decoded: Adam7 interlacing rearranges
+    # the image into seven passes, and a decoder that ignores the flag produces a
+    # plausible-looking wrong image. Named so verify.sh knows what to expect, and
+    # given no .expected file, because there is no right answer to compare.
+    path = os.path.join(outdir, "refuse_interlaced.png")
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 1))
+        + chunk(b"IDAT", zlib.compress(b"\x00" * 40))
+        + chunk(b"IEND", b"")
+    )
+    with open(path, "wb") as f:
+        f.write(png)
+    made.append(path)
+
     for p in made:
         print(os.path.basename(p))
 

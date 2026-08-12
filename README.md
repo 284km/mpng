@@ -15,16 +15,30 @@ PPM out because it is the format with no format: a header and the bytes. That
 makes the output something another tool can check rather than something you have
 to take on trust.
 
-## What it reads
+## What it reads, and writes
 
-8-bit non-interlaced PNGs: colour types 0 (grey), 2 (RGB), 6 (RGBA). The zlib
-stream is reassembled across IDAT chunks first, which is not optional — encoders
-split it at arbitrary points, and a decoder that inflates each chunk on its own
-works on small files and fails on large ones.
+Non-interlaced PNGs: colour types 0 (grey), 2 (RGB), 3 (palette), 6 (RGBA), at 8
+or 16 bits a sample. The zlib stream is reassembled across IDAT chunks first,
+which is not optional — encoders split it at arbitrary points, and a decoder that
+inflates each chunk on its own works on small files and fails on large ones.
 
-Not yet: palette (colour type 3), 16-bit samples, interlacing, and every ancillary
-chunk. Encoding is not here either; `mgz` can deflate, so it is a matter of
-choosing filters.
+Filters operate on *bytes*, so a 16-bit sample means `left` is two bytes further
+back. That distinction decodes 8-bit images perfectly and 16-bit ones into noise
+if you get it wrong, which is why there are 16-bit cases in the tests.
+
+`mpng encode` writes 8-bit RGB PNGs, choosing a filter per scanline the way the
+spec suggests: try all five, keep the one whose bytes have the smallest absolute
+sum, because DEFLATE does better on numbers near zero. Compression is `mgz`'s
+deflate, the chunk CRCs are `mgz`'s crc32, and the zlib Adler-32 is here — a PNG
+carries two different checksums and they are not interchangeable.
+
+**Interlaced (Adam7) files are refused**, not decoded. A decoder that ignores the
+flag produces a plausible-looking wrong image, which is worse than an error, so
+the refusal is a test case of its own.
+
+16-bit output is reduced to the high byte of each sample. Since PNG samples are
+big-endian, that byte *is* the 8-bit value; doing better would mean choosing a
+colour space.
 
 ## Checking it
 
@@ -41,8 +55,10 @@ reconstructed; and a zlib stream split across two IDATs, which a decoder that
 inflates each chunk separately passes everything else and fails.
 
 `CC_CHECK=1` runs the interpreter *and* the compiled binary and compares. That is
-not thoroughness for its own sake — they disagreed once, and [PAIN.md](PAIN.md)
-explains why.
+not thoroughness for its own sake: it has now found three things — one where the
+two backends produced different files, and two where the C backend emitted
+programs a C compiler rejects. [PAIN.md](PAIN.md) has all three, each reduced to
+something small.
 
 ## Why this exists
 

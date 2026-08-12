@@ -18,6 +18,8 @@
 //   read_header  data          -> vec   [width, height, depth, colour, interlace]
 //   decode       data          -> vec   raw pixel bytes, filters undone
 //   channels     colour_type   -> int
+//   palette      data          -> vec   PLTE as r,g,b triples (empty if none)
+//   rgb8         data          -> vec   three bytes a pixel, whatever the file was
 
 import "mgz/inflate.mere";
 
@@ -71,6 +73,7 @@ let type_is = fn data -> fn (i: int) -> fn (a: int) -> fn (b: int) -> fn (c: int
 let is_ihdr = fn data -> fn i -> type_is data i 73 72 68 82;   // IHDR
 let is_idat = fn data -> fn i -> type_is data i 73 68 65 84;   // IDAT
 let is_iend = fn data -> fn i -> type_is data i 73 69 78 68;   // IEND
+let is_plte = fn data -> fn i -> type_is data i 80 76 84 69;   // PLTE
 
 // [width, height, bit depth, colour type, interlace]
 let read_header = fn data ->
@@ -90,9 +93,9 @@ let read_header = fn data ->
       else walk (pos + 12 + len) in
   walk 8;
 
-// Bytes per pixel, by colour type: 0 grey, 2 RGB, 3 palette index, 4 grey+alpha,
-// 6 RGBA. Palette is an index into a table, so one byte wide here even though
-// what it stands for is three.
+// Samples per pixel, by colour type: 0 grey, 2 RGB, 3 palette index, 4
+// grey+alpha, 6 RGBA. Palette is an index into a table, so one sample wide here
+// even though what it stands for is three.
 let channels = fn (colour: int) ->
   if colour == 0 then 1
   else if colour == 2 then 3
@@ -100,6 +103,30 @@ let channels = fn (colour: int) ->
   else if colour == 4 then 2
   else if colour == 6 then 4
   else 0;
+
+// Bytes per pixel, which is what the filters work in: a 16-bit sample is two
+// bytes, and `left` means two bytes further back. Getting this wrong decodes
+// 8-bit images perfectly and 16-bit ones into noise.
+let pixel_bytes = fn (colour: int) -> fn (depth: int) ->
+  channels colour * (if depth == 16 then 2 else 1);
+
+// PLTE, as r,g,b triples. Empty when the file has none, which is every colour
+// type but 3.
+let palette = fn data ->
+  let out = vec_new () in
+  let n = vec_len data in
+  let rec walk = fn (pos: int) ->
+    if pos + 8 > n then out
+    else
+      let len = u32be data pos in
+      if is_iend data (pos + 4) then out
+      else if is_plte data (pos + 4) then
+        let rec copy = fn (i: int) ->
+          if i == len then out
+          else let _ = vec_push out (vec_get data (pos + 8 + i)) in copy (i + 1) in
+        copy 0
+      else walk (pos + 12 + len) in
+  walk 8;
 
 // Every IDAT, in order, as one vec: the zlib stream is split across them at
 // arbitrary points, so this is not optional.
@@ -170,14 +197,68 @@ let unfilter = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
       row (y + 1) in
   row 0;
 
-// Raw pixel bytes: `channels` per pixel, row-major, filters undone.
+// Adam7 interlacing rearranges the image into seven passes of different
+// geometry. Nothing here handles it, and the important part is that a decoder
+// which ignores the flag produces a plausible-looking wrong image rather than an
+// error — so this is checked, and callers are expected to check it too.
+let is_interlaced = fn data ->
+  let h = read_header data in
+  vec_len h == 5 && vec_get h 4 == 1;
+
+// Raw pixel bytes: `pixel_bytes` per pixel, row-major, filters undone.
 let decode = fn data ->
   let h = read_header data in
   if vec_len h == 0 then vec_new ()
   else
     let width = vec_get h 0 in
     let height = vec_get h 1 in
-    let bpp = channels (vec_get h 3) in
+    let bpp = pixel_bytes (vec_get h 3) (vec_get h 2) in
     // zlib: two bytes of header, then the DEFLATE stream mgz knows how to read.
     let raw = inflate (idat_bytes data) 2 in
     unfilter raw width height bpp;
+
+// Three bytes a pixel, whatever the file was: grey expanded, alpha dropped,
+// palette looked up, and a 16-bit sample reduced to its high byte.
+//
+// The high byte rather than a proper reduction: 16-bit PNG samples are
+// big-endian, so the high byte *is* the 8-bit approximation of the value, and
+// pretending to do better would mean choosing a colour space.
+let rgb8 = fn data ->
+  let h = read_header data in
+  let width = vec_get h 0 in
+  let height = vec_get h 1 in
+  let depth = vec_get h 2 in
+  let colour = vec_get h 3 in
+  let bpp = pixel_bytes colour depth in
+  let step = if depth == 16 then 2 else 1 in
+  let pixels = decode data in
+  let pal = palette data in
+  let out = vec_new () in
+  let rec go = fn (i: int) ->
+    if i == width * height then out
+    else
+      let p = i * bpp in
+      let s0 = vec_get pixels p in
+      let _ =
+        if colour == 3 then
+          // An index into PLTE. An index past the end of the table is a broken
+          // file; black is a better answer than a crash.
+          let e = s0 * 3 in
+          if e + 2 < vec_len pal then
+            let _ = vec_push out (vec_get pal e) in
+            let _ = vec_push out (vec_get pal (e + 1)) in
+            vec_push out (vec_get pal (e + 2))
+          else
+            let _ = vec_push out 0 in
+            let _ = vec_push out 0 in
+            vec_push out 0
+        else if colour == 0 || colour == 4 then
+          let _ = vec_push out s0 in
+          let _ = vec_push out s0 in
+          vec_push out s0
+        else
+          let _ = vec_push out s0 in
+          let _ = vec_push out (vec_get pixels (p + step)) in
+          vec_push out (vec_get pixels (p + step * 2)) in
+      go (i + 1) in
+  go 0;

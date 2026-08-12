@@ -7,6 +7,7 @@
 // makes the output something another tool can check rather than something you
 // have to take on trust.
 import "./png.mere";
+import "./encode.mere";
 
 let colour_name = fn (c: int) ->
   if c == 0 then "grey"
@@ -25,8 +26,7 @@ let info = fn data ->
            ++ colour_name (vec_get h 3)
            ++ (if vec_get h 4 == 1 then " interlaced" else ""));
 
-// P6 is binary PPM: three bytes a pixel, no alpha, no compression. Alpha is
-// dropped rather than composited — there is no background to composite onto.
+// P6 is binary PPM: three bytes a pixel, no alpha, no compression.
 //
 // It is built as a vec of bytes and handed to `write_file_bytes`, rather than
 // printed. Printing it is what the first version did, and it does not work: a
@@ -36,38 +36,81 @@ let info = fn data ->
 // in, and differently shorter depending on which backend ran. See PAIN.md.
 let ppm_bytes = fn data ->
   let h = read_header data in
-  let width = vec_get h 0 in
-  let height = vec_get h 1 in
-  let bpp = channels (vec_get h 3) in
-  let pixels = decode data in
   let out = vec_new () in
   let rec header = fn (s: str) -> fn (i: int) ->
     if i >= str_len s then ()
     else
       let _ = vec_push out (ord (char_at s i)) in
       header s (i + 1) in
-  let _ = header ("P6\n" ++ str_of_int width ++ " " ++ str_of_int height ++ "\n255\n") 0 in
+  let _ = header ("P6\n" ++ str_of_int (vec_get h 0) ++ " "
+                  ++ str_of_int (vec_get h 1) ++ "\n255\n") 0 in
+  let rgb = rgb8 data in
+  let n = vec_len rgb in
   let rec go = fn (i: int) ->
-    if i == width * height then out
-    else
-      let p = i * bpp in
-      let r = vec_get pixels p in
-      let g = if bpp >= 3 then vec_get pixels (p + 1) else r in
-      let b = if bpp >= 3 then vec_get pixels (p + 2) else r in
-      let _ = vec_push out r in
-      let _ = vec_push out g in
-      let _ = vec_push out b in
-      go (i + 1) in
+    if i == n then out
+    else let _ = vec_push out (vec_get rgb i) in go (i + 1) in
   go 0;
 
-let usage = "usage: mpng info <file.png>  |  mpng ppm <file.png> <out.ppm>";
+// Reading a PPM back, so `encode` has something to encode. P6 only, and only
+// the header shape this project's own `ppm` writes — a full PPM parser is not
+// what is being tested here.
+let read_ppm = fn data ->
+  let n = vec_len data in
+  let acc = vec_new () in
+  // Three whitespace-separated numbers after "P6": width, height, maxval, then
+  // where the pixels start.
+  //
+  // The accumulator is captured rather than passed. Passing it made this an
+  // inner `let rec` with five curried parameters ending in a vec, and the C
+  // backend emits a forward declaration for that whose closure type name it
+  // never defines — twelve lines reproduce it, see PAIN.md P5. Capturing it is
+  // better code anyway; it is a mutable buffer, not a value being threaded.
+  let rec fields = fn (i: int) -> fn (got: int) -> fn (cur: int) -> fn (seen: int) ->
+    if i >= n then ()
+    else
+      let c = vec_get data i in
+      if c >= 48 && c <= 57 then fields (i + 1) got (cur * 10 + c - 48) 1
+      else if seen == 1 then
+        let _ = vec_push acc cur in
+        if got == 2 then let _ = vec_push acc (i + 1) in ()
+        else fields (i + 1) (got + 1) 0 0
+      else fields (i + 1) got 0 0 in
+  let _ = fields 2 0 0 0 in
+  acc;
+
+let usage =
+  "usage: mpng info <file.png>  |  mpng ppm <file.png> <out.ppm>  |  mpng encode <in.ppm> <out.png>";
+
+let encode_cmd = fn (path: str) -> fn (out: str) ->
+  let data = read_file_bytes path in
+  let f = read_ppm data in
+  if vec_len f < 4 then print "not a PPM this can read (P6 only)"
+  else
+    let width = vec_get f 0 in
+    let height = vec_get f 1 in
+    let start = vec_get f 3 in
+    let pixels = vec_new () in
+    let rec copy = fn (i: int) ->
+      if i >= width * height * 3 then ()
+      else let _ = vec_push pixels (vec_get data (start + i)) in copy (i + 1) in
+    let _ = copy 0 in
+    let png = encode_rgb8 pixels width height in
+    let _ = write_file_bytes out png in
+    print (str_of_int width ++ "x" ++ str_of_int height ++ " -> " ++ out
+           ++ " (" ++ str_of_int (vec_len png) ++ " bytes)");
 
 let main = fn () ->
   match args () with
+  | Cons ("encode", Cons (path, Cons (out, _))) -> encode_cmd path out
   | Cons (cmd, Cons (path, rest)) ->
     let data = read_file_bytes path in
     if is_png data == false then print "not a PNG"
     else if cmd == "info" then info data
+    else if is_interlaced data then
+      // Refusing is the point: ignoring the flag decodes an interlaced file into
+      // a plausible-looking wrong image, which is worse than not decoding it.
+      print "interlaced (Adam7) is not supported yet"
+
     else if cmd == "ppm" then
       (match rest with
        | Cons (out, _) ->
@@ -76,6 +119,7 @@ let main = fn () ->
          print (str_of_int (vec_len bytes) ++ " bytes -> " ++ out)
        | Nil -> print usage)
     else print usage
+  | Cons (cmd, Nil) -> print usage
   | _ -> print usage;
 let _ = main () in
 // Exit explicitly, or the runtime echoes this program's own final value — `()`

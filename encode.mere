@@ -64,12 +64,12 @@ let paeth_e = fn (a: int) -> fn (b: int) -> fn (c: int) ->
 // One filtered scanline, for a given filter type. `line` and `prev` are the
 // unfiltered bytes; `prev` is empty for the first row.
 //
-// The parameter is `line` and not `row` because of a bug it used to trip: with a
-// `let rec row` in png.mere and a parameter called `row` here, the C backend's
-// inner-function lifting left `row` out of this one's capture list and emitted a
-// body referring to an identifier it never declared. Fixed upstream in mere
-// v0.1.217 (see PAIN.md P6); the name stays because two things called `row` in
-// one program is worth avoiding anyway.
+// This parameter is called `row` on purpose, now. With a `let rec row` in
+// png.mere and a parameter called `row` here, the C backend's inner-function
+// lifting used to leave `row` out of this function's capture list and emit a body
+// referring to an identifier it never declared — see PAIN.md P6, fixed upstream in
+// mere v0.1.217. Keeping the name means this file is the shape that found it, and
+// `verify.sh` compiling it is the test that it stays fixed.
 let filter_row = fn (kind: int) -> fn row -> fn prev -> fn (bpp: int) ->
   let n = vec_len row in
   let out = vec_new () in

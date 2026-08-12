@@ -160,8 +160,11 @@ the emitted C without a compiler.
   type was emitted from a copy where the region had resolved to `__heap`. An
   unresolved marker now tags as the default region.
 
-This program keeps its workarounds anyway: `line` instead of `row` reads better,
-and capturing the accumulator instead of threading it is better code.
+One workaround stays and one was reverted. Capturing the accumulator instead of
+threading it is better code either way, so it stays. The parameter went back to
+being called `row`: with the bug fixed, keeping the name that exposed it means this
+file *is* the shape that found it, and `CC_CHECK=1` compiling it is the test that
+it stays fixed.
 \n## What went well, and is worth saying
 
 **`mgz` as a package worked on the first try.** `mere install` fetched it at a

@@ -3,7 +3,7 @@
 A dogfood's job is to name what the language made hard. In order of how much it
 cost.
 
-## P1 — `print_no_nl (chr 0)` writes nothing in the compiled backends
+## P1 — `print_no_nl (chr 0)` writes nothing in the compiled backends — **fixed upstream**
 
 Two lines are enough:
 
@@ -38,12 +38,30 @@ first-class `bytes` type or make `str` length-carrying. This program is a vote
 that it is not academic: the workaround exists, works, and means a program that
 handles binary cannot use the language's string type for any part of it.
 
-## P2 — a byte costs eight
+**Resolved in mere v0.1.216.** The `bytes` type turned out to already exist, with
+a complete in-memory API; what it had no way to do was *leave the program*. So the
+answer was three builtins at the boundary rather than a new type:
 
-`read_file_bytes` returns `Vec[int]`, and an `int` is 64 bits, so a 46KB PNG
-occupies 370KB before anything is decoded, and its inflated scanlines another
-2MB. Nothing failed because of it at this size. It is the same missing type as P1
-seen from the other side: there is no way to say "a sequence of bytes".
+    read_bytes  : str -> bytes            interp + C
+    write_bytes : str -> bytes -> unit    interp + C
+    print_bytes : bytes -> unit           interp + C + LLVM
+
+A `bytes` carries its length in every backend, which is what makes them correct
+where `print_no_nl` could not be. `mpng` reads and writes through them now, and
+`verify.sh` still compares the interpreter against the compiled binary — the check
+that found this in the first place stays.
+
+## P2 — a byte costs eight, in the middle
+
+Half fixed by the same change. The file now arrives as a `bytes` (one byte per
+byte) and leaves as one, but the decoder converts to `Vec[int]` on the way in
+because it needs random access *and mutation*: reconstructing a scanline writes
+into the middle of a buffer, and `bytes` is immutable.
+
+So the boundary is cheap now and the middle still costs eight bytes a byte. What
+is missing is a mutable byte buffer — `StrBuf` is the shape, but it is a string
+builder, with the NUL problem that implies. That is a design question rather than
+an oversight, and it is the one this program would ask next.
 
 ## P3 — the interpreter cannot run this on a real image
 

@@ -81,8 +81,14 @@ let read_ppm = fn data ->
 let usage =
   "usage: mpng info <file.png>  |  mpng ppm <file.png> <out.ppm>  |  mpng encode <in.ppm> <out.png>";
 
+// `read_bytes` gives a `bytes` — one byte per byte, and NUL-safe. The decoder
+// wants random access and mutation, so it is converted to a vec once here rather
+// than being read as one: `read_file_bytes` returns a Vec[int], eight bytes per
+// byte, which is the cost this avoids at the boundary. See PAIN.md P2.
+let load = fn (path: str) -> vec_of_bytes (read_bytes path);
+
 let encode_cmd = fn (path: str) -> fn (out: str) ->
-  let data = read_file_bytes path in
+  let data = load path in
   let f = read_ppm data in
   if vec_len f < 4 then print "not a PPM this can read (P6 only)"
   else
@@ -94,16 +100,16 @@ let encode_cmd = fn (path: str) -> fn (out: str) ->
       if i >= width * height * 3 then ()
       else let _ = vec_push pixels (vec_get data (start + i)) in copy (i + 1) in
     let _ = copy 0 in
-    let png = encode_rgb8 pixels width height in
-    let _ = write_file_bytes out png in
+    let png = bytes_of_vec (encode_rgb8 pixels width height) in
+    let _ = write_bytes out png in
     print (str_of_int width ++ "x" ++ str_of_int height ++ " -> " ++ out
-           ++ " (" ++ str_of_int (vec_len png) ++ " bytes)");
+           ++ " (" ++ str_of_int (bytes_len png) ++ " bytes)");
 
 let main = fn () ->
   match args () with
   | Cons ("encode", Cons (path, Cons (out, _))) -> encode_cmd path out
   | Cons (cmd, Cons (path, rest)) ->
-    let data = read_file_bytes path in
+    let data = load path in
     if is_png data == false then print "not a PNG"
     else if cmd == "info" then info data
     else if is_interlaced data then
@@ -114,9 +120,9 @@ let main = fn () ->
     else if cmd == "ppm" then
       (match rest with
        | Cons (out, _) ->
-         let bytes = ppm_bytes data in
-         let _ = write_file_bytes out bytes in
-         print (str_of_int (vec_len bytes) ++ " bytes -> " ++ out)
+         let b = bytes_of_vec (ppm_bytes data) in
+         let _ = write_bytes out b in
+         print (str_of_int (bytes_len b) ++ " bytes -> " ++ out)
        | Nil -> print usage)
     else print usage
   | Cons (cmd, Nil) -> print usage

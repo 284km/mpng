@@ -19,6 +19,9 @@
 //   decode       data          -> vec   raw pixel bytes, filters undone
 //   channels     colour_type   -> int
 //   palette      data          -> vec   PLTE as r,g,b triples (empty if none)
+//   text_chunks  data          -> vec   tEXt chunks as "keyword: text"
+//   gamma        data          -> int   gAMA in hundred-thousandths, 0 if absent
+//   has_transparency data      -> bool  is there a tRNS chunk
 //   rgb8         data          -> vec   three bytes a pixel, whatever the file was
 
 import "mgz/inflate.mere";
@@ -74,6 +77,9 @@ let is_ihdr = fn data -> fn i -> type_is data i 73 72 68 82;   // IHDR
 let is_idat = fn data -> fn i -> type_is data i 73 68 65 84;   // IDAT
 let is_iend = fn data -> fn i -> type_is data i 73 69 78 68;   // IEND
 let is_plte = fn data -> fn i -> type_is data i 80 76 84 69;   // PLTE
+let is_text = fn data -> fn i -> type_is data i 116 69 88 116;  // tEXt
+let is_gama = fn data -> fn i -> type_is data i 103 65 77 65;  // gAMA
+let is_trns = fn data -> fn i -> type_is data i 116 82 78 83;  // tRNS
 
 // [width, height, bit depth, colour type, interlace]
 let read_header = fn data ->
@@ -147,6 +153,68 @@ let idat_bytes = fn data ->
             copy 0
           else () in
         walk (pos + 12 + len) in
+  walk 8;
+
+// --- what else the file says -----------------------------------------------
+//
+// Ancillary chunks: the ones a decoder may ignore and a reader may want. Their
+// lower-case first letter is the convention that says so, which is why `tEXt` and
+// `IHDR` differ in more than name.
+
+// The text of every tEXt chunk, as "keyword: text" lines. A tEXt is a keyword,
+// a zero byte, then Latin-1 text — the zero is a separator inside the chunk, not
+// a terminator, which is a small reminder of why `bytes` exists.
+let text_chunks = fn data ->
+  let out = vec_new () in
+  let n = vec_len data in
+  let rec walk = fn (pos: int) ->
+    if pos + 8 > n then out
+    else
+      let len = u32be data pos in
+      if is_iend data (pos + 4) then out
+      else
+        let _ =
+          if is_text data (pos + 4) then
+            let d = pos + 8 in
+            let buf = strbuf_new () in
+            let rec chars = fn (i: int) -> fn (seen_sep: bool) ->
+              if i == len then ()
+              else
+                let b = vec_get data (d + i) in
+                if b == 0 && seen_sep == false then
+                  let _ = strbuf_push buf ": " in
+                  chars (i + 1) true
+                else
+                  let _ = strbuf_push buf (chr b) in
+                  chars (i + 1) seen_sep in
+            let _ = chars 0 false in
+            vec_push out (strbuf_to_str buf)
+          else () in
+        walk (pos + 12 + len) in
+  walk 8;
+
+// gAMA, in hundred-thousandths as the file stores it. `0` for absent, which is
+// not a gamma anybody means.
+let gamma = fn data ->
+  let n = vec_len data in
+  let rec walk = fn (pos: int) ->
+    if pos + 8 > n then 0
+    else
+      let len = u32be data pos in
+      if is_iend data (pos + 4) then 0
+      else if is_gama data (pos + 4) then u32be data (pos + 8)
+      else walk (pos + 12 + len) in
+  walk 8;
+
+let has_transparency = fn data ->
+  let n = vec_len data in
+  let rec walk = fn (pos: int) ->
+    if pos + 8 > n then false
+    else
+      let len = u32be data pos in
+      if is_iend data (pos + 4) then false
+      else if is_trns data (pos + 4) then true
+      else walk (pos + 12 + len) in
   walk 8;
 
 // --- undoing the scanline filters (RFC 2083 §6) ---------------------------

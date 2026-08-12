@@ -83,6 +83,61 @@ for name in rgb_mixed.png rgb_split_idat.png; do
   fi
 done
 
+# A grey image must come back as colour type 0 — a third the samples — and its
+# pixels must survive the trip. The encoder choosing the cheapest true claim about
+# the data is the other decision it makes, after the filters.
+python3 - "$TMP" <<'GREY'
+import sys
+w, h = 8, 6
+px = bytearray()
+for y in range(h):
+    for x in range(w):
+        v = (x * 17 + y * 29) % 256
+        px += bytes([v, v, v])
+open(sys.argv[1] + "/grey.ppm", "wb").write(b"P6\n%d %d\n255\n" % (w, h) + bytes(px))
+GREY
+"$MERE" "$DIR/mpng.mere" encode "$TMP/grey.ppm" "$TMP/grey.png" > /dev/null
+if "$MERE" "$DIR/mpng.mere" info "$TMP/grey.png" | grep -q "grey"; then
+  printf '  ok    a grey image is encoded as grey, not as RGB\n'
+  pass=$((pass + 1))
+else
+  printf '  FAIL  a grey image was encoded as RGB\n'
+  fail=$((fail + 1))
+fi
+"$MERE" "$DIR/mpng.mere" ppm "$TMP/grey.png" "$TMP/grey2.ppm" > /dev/null
+if cmp -s "$TMP/grey.ppm" "$TMP/grey2.ppm"; then
+  printf '  ok    and its pixels survive the round trip\n'
+  pass=$((pass + 1))
+else
+  printf '  FAIL  the grey round trip changed the pixels\n'
+  fail=$((fail + 1))
+fi
+
+# The ancillary chunks a reader may want: text, gamma, transparency. The zero byte
+# inside a tEXt is a separator, not a terminator, which is a small reminder of why
+# `bytes` exists.
+python3 - "$TMP" <<'ANC'
+import struct, sys, zlib
+def chunk(t, d):
+    c = t + d
+    return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
+raw = b"\x00" + bytes([9, 9, 9]) + b"\x00" + bytes([8, 8, 8])
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 2, 8, 2, 0, 0, 0))
+       + chunk(b"gAMA", struct.pack(">I", 45455))
+       + chunk(b"tEXt", b"Author\x00Somebody")
+       + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+open(sys.argv[1] + "/ancillary.png", "wb").write(png)
+ANC
+anc=$("$MERE" "$DIR/mpng.mere" info "$TMP/ancillary.png")
+if printf '%s' "$anc" | grep -q "gamma 45455" && printf '%s' "$anc" | grep -q "Author: Somebody"; then
+  printf '  ok    gAMA and tEXt are read and reported\n'
+  pass=$((pass + 1))
+else
+  printf '  FAIL  ancillary chunks were not reported: %s\n' "$anc"
+  fail=$((fail + 1))
+fi
+
 # The backends have to agree. They did not, once: writing the PPM through
 # `print_no_nl` dropped every zero byte in the compiled backends and kept them in
 # the interpreter, so the same image decoded to two different files. Nothing but

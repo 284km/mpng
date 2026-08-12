@@ -5,7 +5,7 @@ scanline filters — with the inflating done by [mgz](https://github.com/284km/m
 this project's gzip implementation, used as a package.
 
 ```sh
-mere mpng.mere info app.png          # 736x724 8-bit rgba
+mere mpng.mere info app.png          # 736x724 8-bit rgba +tRNS gamma 45455
 mere mpng.mere ppm app.png out.ppm   # the pixels, as a PPM
 
 mere -c mpng.mere > mpng.c && clang -O2 mpng.c -o mpng   # for real images
@@ -26,9 +26,12 @@ Filters operate on *bytes*, so a 16-bit sample means `left` is two bytes further
 back. That distinction decodes 8-bit images perfectly and 16-bit ones into noise
 if you get it wrong, which is why there are 16-bit cases in the tests.
 
-`mpng encode` writes 8-bit RGB PNGs, choosing a filter per scanline the way the
-spec suggests: try all five, keep the one whose bytes have the smallest absolute
-sum, because DEFLATE does better on numbers near zero. Compression is `mgz`'s
+`mpng encode` writes 8-bit PNGs, making the two decisions an encoder has to. A
+**filter per scanline**, the way the spec suggests: try all five, keep the one whose
+bytes have the smallest absolute sum, because DEFLATE does better on numbers near
+zero. And a **colour type**: grey when every pixel is grey, which is a third of the
+samples. PNG's colour types are not a description of the data but a claim about it,
+and the cheapest true claim is the right one. Compression is `mgz`'s
 deflate, the chunk CRCs are `mgz`'s crc32, and the zlib Adler-32 is here — a PNG
 carries two different checksums and they are not interchangeable.
 
@@ -48,6 +51,11 @@ assumes otherwise.
 16-bit output is reduced to the high byte of each sample. Since PNG samples are
 big-endian, that byte *is* the 8-bit value; doing better would mean choosing a
 colour space.
+
+`info` also reports what the ancillary chunks say — the ones a decoder may ignore
+and a reader may want: `gAMA`, whether there is a `tRNS`, and every `tEXt` as
+`keyword: text`. The zero byte inside a `tEXt` is a separator and not a terminator,
+which is a small reminder of why this language needed a `bytes` type.
 
 ## Checking it
 

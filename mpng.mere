@@ -21,10 +21,21 @@ let info = fn data ->
   let h = read_header data in
   if vec_len h == 0 then print "no IHDR: not a PNG this can read"
   else
-    print (str_of_int (vec_get h 0) ++ "x" ++ str_of_int (vec_get h 1)
-           ++ " " ++ str_of_int (vec_get h 2) ++ "-bit "
-           ++ colour_name (vec_get h 3)
-           ++ (if vec_get h 4 == 1 then " interlaced" else ""));
+    let g = gamma data in
+    let _ =
+      print (str_of_int (vec_get h 0) ++ "x" ++ str_of_int (vec_get h 1)
+             ++ " " ++ str_of_int (vec_get h 2) ++ "-bit "
+             ++ colour_name (vec_get h 3)
+             ++ (if vec_get h 4 == 1 then " interlaced" else "")
+             ++ (if has_transparency data then " +tRNS" else "")
+             ++ (if g > 0 then " gamma " ++ str_of_int g else "")) in
+    // The ancillary text, if any: a keyword and a string, which is where a PNG
+    // keeps who made it and when.
+    let t = text_chunks data in
+    let rec show = fn (i: int) ->
+      if i >= vec_len t then ()
+      else let _ = print ("  " ++ vec_get t i) in show (i + 1) in
+    show 0;
 
 // P6 is binary PPM: three bytes a pixel, no alpha, no compression.
 //

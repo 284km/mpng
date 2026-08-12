@@ -116,9 +116,25 @@ let best_filter = fn row -> fn prev -> fn (bpp: int) ->
   let first = filter_row 0 row prev bpp in
   go 1 0 (row_cost first) first;
 
-// A complete PNG: 8-bit RGB, no interlacing, one IDAT.
+// Is every pixel grey? Then the file can say so and be a third the size. This is
+// the other decision an encoder makes, after the filters: PNG's colour types are
+// not a description of the data but a claim about it, and the cheapest true claim
+// is the right one.
+let all_grey = fn pixels -> fn (n: int) ->
+  let rec go = fn (i: int) ->
+    if i >= n then true
+    else
+      let p = i * 3 in
+      if vec_get pixels p == vec_get pixels (p + 1)
+         && vec_get pixels p == vec_get pixels (p + 2)
+      then go (i + 1) else false in
+  go 0;
+
+// A complete PNG: 8 bits a sample, no interlacing, one IDAT — grey when the
+// pixels are grey, RGB otherwise.
 let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
-  let bpp = 3 in
+  let grey = all_grey pixels (width * height) in
+  let bpp = if grey then 1 else 3 in
   let stride = width * bpp in
   // The filtered scanlines, which is what gets compressed.
   let raw = vec_new () in
@@ -128,7 +144,12 @@ let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
       let row = vec_new () in
       let rec col = fn (x: int) ->
         if x == stride then ()
-        else let _ = vec_push row (vec_get pixels (y * stride + x)) in col (x + 1) in
+        else
+          // In grey, one sample per pixel: take the red channel, which the check
+          // above proved is the whole story.
+          let src = if grey then (y * width + x) * 3 else y * stride + x in
+          let _ = vec_push row (vec_get pixels src) in
+          col (x + 1) in
       let _ = col 0 in
       let _ = push_all raw (best_filter row prev bpp) in
       rows (y + 1) row in
@@ -159,7 +180,7 @@ let encode_rgb8 = fn pixels -> fn (width: int) -> fn (height: int) ->
   let _ = bytes_push4be ihdr width in
   let _ = bytes_push4be ihdr height in
   let _ = vec_push ihdr 8 in     // bit depth
-  let _ = vec_push ihdr 2 in     // colour type: RGB
+  let _ = vec_push ihdr (if grey then 0 else 2) in     // colour type
   let _ = vec_push ihdr 0 in     // compression: deflate, the only one
   let _ = vec_push ihdr 0 in     // filter method: the five above, the only set
   let _ = vec_push ihdr 0 in     // interlace: none

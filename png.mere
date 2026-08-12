@@ -1,0 +1,183 @@
+// png.mere — reading PNG (RFC 2083), in pure Mere.
+//
+// A module: definitions only, no program. `mpng.mere` is the CLI.
+//
+// The shape of a PNG is: an 8-byte signature, then a sequence of chunks, each
+// one a length, a four-character type, that many bytes, and a CRC. The image
+// itself is in the IDAT chunks, which hold one zlib stream split across them —
+// so the bytes have to be concatenated before they mean anything, and a decoder
+// that inflates each chunk on its own works on most files and fails on large
+// ones.
+//
+// Inflating is `mgz`, which is this project's own gzip implementation used as a
+// package rather than copied in. zlib is DEFLATE with two bytes in front and a
+// checksum behind, so `inflate data 2` is the whole of it.
+//
+// Exports:
+//   is_png       data          -> bool
+//   read_header  data          -> vec   [width, height, depth, colour, interlace]
+//   decode       data          -> vec   raw pixel bytes, filters undone
+//   channels     colour_type   -> int
+
+import "mgz/inflate.mere";
+
+// A fixed-size vec, zeroed. Not a builtin: `vec_new` grows by pushing, and a
+// decoder that reconstructs scanlines needs to write into the middle of one.
+let new_vec = fn (n: int) -> fn (x: int) ->
+  let v = vec_new () in
+  let rec go = fn i -> if i >= n then () else let _ = vec_push v x in go (i + 1) in
+  let _ = go 0 in
+  v;
+
+// 137 P N G \r \n 26 \n — the last four catch a file mangled by a transfer that
+// thought it was text, which is why they are there.
+let png_sig =
+  let v = vec_new () in
+  let rec go = fn i ->
+    if i >= 8 then ()
+    else
+      let b =
+        if i == 0 then 137 else if i == 1 then 80 else if i == 2 then 78
+        else if i == 3 then 71 else if i == 4 then 13 else if i == 5 then 10
+        else if i == 6 then 26 else 10 in
+      let _ = vec_push v b in
+      go (i + 1) in
+  let _ = go 0 in
+  v;
+
+let is_png = fn data ->
+  if vec_len data < 8 then false
+  else
+    let rec go = fn i ->
+      if i == 8 then true
+      else if vec_get data i != vec_get png_sig i then false
+      else go (i + 1) in
+    go 0;
+
+// Big-endian, unlike DEFLATE's little-endian bit order — a PNG carries both
+// conventions and mixing them up is the first bug everybody writes.
+let u32be = fn data -> fn (i: int) ->
+  vec_get data i * 16777216
+  + vec_get data (i + 1) * 65536
+  + vec_get data (i + 2) * 256
+  + vec_get data (i + 3);
+
+// A chunk's type is four ASCII characters at a known offset; comparing them as
+// numbers avoids building a string per chunk.
+let type_is = fn data -> fn (i: int) -> fn (a: int) -> fn (b: int) -> fn (c: int) -> fn (d: int) ->
+  vec_get data i == a && vec_get data (i + 1) == b
+  && vec_get data (i + 2) == c && vec_get data (i + 3) == d;
+
+let is_ihdr = fn data -> fn i -> type_is data i 73 72 68 82;   // IHDR
+let is_idat = fn data -> fn i -> type_is data i 73 68 65 84;   // IDAT
+let is_iend = fn data -> fn i -> type_is data i 73 69 78 68;   // IEND
+
+// [width, height, bit depth, colour type, interlace]
+let read_header = fn data ->
+  let rec walk = fn (pos: int) ->
+    if pos + 8 > vec_len data then vec_new ()
+    else
+      let len = u32be data pos in
+      if is_ihdr data (pos + 4) then
+        let d = pos + 8 in
+        let h = vec_new () in
+        let _ = vec_push h (u32be data d) in
+        let _ = vec_push h (u32be data (d + 4)) in
+        let _ = vec_push h (vec_get data (d + 8)) in
+        let _ = vec_push h (vec_get data (d + 9)) in
+        let _ = vec_push h (vec_get data (d + 12)) in
+        h
+      else walk (pos + 12 + len) in
+  walk 8;
+
+// Bytes per pixel, by colour type: 0 grey, 2 RGB, 3 palette index, 4 grey+alpha,
+// 6 RGBA. Palette is an index into a table, so one byte wide here even though
+// what it stands for is three.
+let channels = fn (colour: int) ->
+  if colour == 0 then 1
+  else if colour == 2 then 3
+  else if colour == 3 then 1
+  else if colour == 4 then 2
+  else if colour == 6 then 4
+  else 0;
+
+// Every IDAT, in order, as one vec: the zlib stream is split across them at
+// arbitrary points, so this is not optional.
+let idat_bytes = fn data ->
+  let out = vec_new () in
+  let n = vec_len data in
+  let rec walk = fn (pos: int) ->
+    if pos + 8 > n then out
+    else
+      let len = u32be data pos in
+      if is_iend data (pos + 4) then out
+      else
+        let _ =
+          if is_idat data (pos + 4) then
+            let rec copy = fn (i: int) ->
+              if i == len then ()
+              else let _ = vec_push out (vec_get data (pos + 8 + i)) in copy (i + 1) in
+            copy 0
+          else () in
+        walk (pos + 12 + len) in
+  walk 8;
+
+// --- undoing the scanline filters (RFC 2083 §6) ---------------------------
+//
+// Each scanline is preceded by one byte saying how it was filtered, and each
+// filter predicts a byte from its neighbours: the one to the left, the one
+// above, or both. Undoing them has to happen in order, because a scanline is
+// reconstructed against the *reconstructed* line above it, not the raw one.
+
+let paeth = fn (a: int) -> fn (b: int) -> fn (c: int) ->
+  let p = a + b - c in
+  let pa = if p >= a then p - a else a - p in
+  let pb = if p >= b then p - b else b - p in
+  let pc = if p >= c then p - c else c - p in
+  if pa <= pb && pa <= pc then a
+  else if pb <= pc then b
+  else c;
+
+// `raw` is the inflated stream: (1 + stride) bytes per scanline. The result is
+// the same rows with the filter bytes gone and the prediction undone.
+let unfilter = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
+  let stride = width * bpp in
+  let out = new_vec (stride * height) 0 in
+  let rec row = fn (y: int) ->
+    if y == height then out
+    else
+      let src = y * (stride + 1) in
+      let ft = vec_get raw src in
+      let dst = y * stride in
+      let rec col = fn (x: int) ->
+        if x == stride then ()
+        else
+          let cur = vec_get raw (src + 1 + x) in
+          let left = if x >= bpp then vec_get out (dst + x - bpp) else 0 in
+          let up = if y > 0 then vec_get out (dst - stride + x) else 0 in
+          let upleft =
+            if y > 0 && x >= bpp then vec_get out (dst - stride + x - bpp) else 0 in
+          let v =
+            if ft == 0 then cur
+            else if ft == 1 then cur + left
+            else if ft == 2 then cur + up
+            else if ft == 3 then cur + (left + up) / 2
+            else if ft == 4 then cur + paeth left up upleft
+            else cur in
+          let _ = vec_set out (dst + x) (bit_and v 255) in
+          col (x + 1) in
+      let _ = col 0 in
+      row (y + 1) in
+  row 0;
+
+// Raw pixel bytes: `channels` per pixel, row-major, filters undone.
+let decode = fn data ->
+  let h = read_header data in
+  if vec_len h == 0 then vec_new ()
+  else
+    let width = vec_get h 0 in
+    let height = vec_get h 1 in
+    let bpp = channels (vec_get h 3) in
+    // zlib: two bytes of header, then the DEFLATE stream mgz knows how to read.
+    let raw = inflate (idat_bytes data) 2 in
+    unfilter raw width height bpp;

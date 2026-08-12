@@ -1,0 +1,84 @@
+// mpng — read a PNG.
+//
+//   mpng info <file.png>        what the header says
+//   mpng ppm  <file.png>        the pixels, as a PPM on stdout
+//
+// PPM because it is the format with no format: a header and the bytes, which
+// makes the output something another tool can check rather than something you
+// have to take on trust.
+import "./png.mere";
+
+let colour_name = fn (c: int) ->
+  if c == 0 then "grey"
+  else if c == 2 then "rgb"
+  else if c == 3 then "palette"
+  else if c == 4 then "grey+alpha"
+  else if c == 6 then "rgba"
+  else "unknown";
+
+let info = fn data ->
+  let h = read_header data in
+  if vec_len h == 0 then print "no IHDR: not a PNG this can read"
+  else
+    print (str_of_int (vec_get h 0) ++ "x" ++ str_of_int (vec_get h 1)
+           ++ " " ++ str_of_int (vec_get h 2) ++ "-bit "
+           ++ colour_name (vec_get h 3)
+           ++ (if vec_get h 4 == 1 then " interlaced" else ""));
+
+// P6 is binary PPM: three bytes a pixel, no alpha, no compression. Alpha is
+// dropped rather than composited — there is no background to composite onto.
+//
+// It is built as a vec of bytes and handed to `write_file_bytes`, rather than
+// printed. Printing it is what the first version did, and it does not work: a
+// Mere `str` is a NUL-terminated C string in the compiled backends, so
+// `print_no_nl (chr 0)` writes nothing at all there while the interpreter writes
+// the zero byte. An image with a black pixel in it came out shorter than it went
+// in, and differently shorter depending on which backend ran. See PAIN.md.
+let ppm_bytes = fn data ->
+  let h = read_header data in
+  let width = vec_get h 0 in
+  let height = vec_get h 1 in
+  let bpp = channels (vec_get h 3) in
+  let pixels = decode data in
+  let out = vec_new () in
+  let rec header = fn (s: str) -> fn (i: int) ->
+    if i >= str_len s then ()
+    else
+      let _ = vec_push out (ord (char_at s i)) in
+      header s (i + 1) in
+  let _ = header ("P6\n" ++ str_of_int width ++ " " ++ str_of_int height ++ "\n255\n") 0 in
+  let rec go = fn (i: int) ->
+    if i == width * height then out
+    else
+      let p = i * bpp in
+      let r = vec_get pixels p in
+      let g = if bpp >= 3 then vec_get pixels (p + 1) else r in
+      let b = if bpp >= 3 then vec_get pixels (p + 2) else r in
+      let _ = vec_push out r in
+      let _ = vec_push out g in
+      let _ = vec_push out b in
+      go (i + 1) in
+  go 0;
+
+let usage = "usage: mpng info <file.png>  |  mpng ppm <file.png> <out.ppm>";
+
+let main = fn () ->
+  match args () with
+  | Cons (cmd, Cons (path, rest)) ->
+    let data = read_file_bytes path in
+    if is_png data == false then print "not a PNG"
+    else if cmd == "info" then info data
+    else if cmd == "ppm" then
+      (match rest with
+       | Cons (out, _) ->
+         let bytes = ppm_bytes data in
+         let _ = write_file_bytes out bytes in
+         print (str_of_int (vec_len bytes) ++ " bytes -> " ++ out)
+       | Nil -> print usage)
+    else print usage
+  | _ -> print usage;
+let _ = main () in
+// Exit explicitly, or the runtime echoes this program's own final value — `()`
+// and a newline — after the PPM, and three bytes of that is the difference
+// between an image and a corrupt file.
+exit 0

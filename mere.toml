@@ -1,0 +1,7 @@
+[package]
+name = "mpng"
+version = "0.1.0"
+path = "github.com/284km/mpng"
+
+[dependencies]
+mgz = { git = "https://github.com/284km/mgz", rev = "57efe4ce14149e29ae5ab978d08195012a3e4eae" }

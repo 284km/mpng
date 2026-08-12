@@ -1,0 +1,4 @@
+.mere_modules/
+mere.lock
+*.ppm
+*.c

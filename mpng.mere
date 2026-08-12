@@ -112,10 +112,6 @@ let main = fn () ->
     let data = load path in
     if is_png data == false then print "not a PNG"
     else if cmd == "info" then info data
-    else if is_interlaced data then
-      // Refusing is the point: ignoring the flag decodes an interlaced file into
-      // a plausible-looking wrong image, which is worse than not decoding it.
-      print "interlaced (Adam7) is not supported yet"
 
     else if cmd == "ppm" then
       (match rest with

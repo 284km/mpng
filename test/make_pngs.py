@@ -127,6 +127,48 @@ def case(outdir, name, width, height, colour, filters, split_idat=False,
     return path
 
 
+ADAM7 = [  # (xstart, ystart, xstep, ystep)
+    (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+    (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2),
+]
+
+
+def interlaced_case(outdir, name, width, height):
+    """An Adam7 image, with the expected PPM computed from the same pixels."""
+    colour, bpp = 2, 3
+    pixels = [[((x * 37 + y * 11 + c * 53) % 256) for x in range(width) for c in range(bpp)]
+              for y in range(height)]
+    raw = b""
+    for (xs, ys, xstep, ystep) in ADAM7:
+        pw = (width - xs + xstep - 1) // xstep
+        ph = (height - ys + ystep - 1) // ystep
+        if pw <= 0 or ph <= 0:
+            continue          # contributes nothing at all, not even filter bytes
+        prev = None
+        for py in range(ph):
+            sy = ys + py * ystep
+            row = bytearray()
+            for px in range(pw):
+                sx = xs + px * xstep
+                row += bytes(pixels[sy][sx * bpp : (sx + 1) * bpp])
+            # A different filter per pass, so the per-pass "first row has nothing
+            # above it" rule is exercised rather than assumed.
+            kind = (ADAM7.index((xs, ys, xstep, ystep)) + py) % 5
+            raw += filter_scanline(kind, bytes(row), prev, bpp)
+            prev = bytes(row)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, colour, 0, 0, 1))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+    path = os.path.join(outdir, name)
+    with open(path, "wb") as f:
+        f.write(png)
+    write_expected(path, width, height, colour, pixels)
+    return path
+
+
 def main():
     outdir = sys.argv[1]
     os.makedirs(outdir, exist_ok=True)
@@ -150,20 +192,16 @@ def main():
     # This decodes as noise if `left` is computed in samples instead of bytes.
     made.append(case(outdir, "rgb16_mixed.png", 6, 4, 2, [0, 1, 2, 3, 4], depth=16))
     made.append(case(outdir, "grey16_mixed.png", 5, 3, 0, [0, 1, 2, 3, 4], depth=16))
-    # A file that must be *refused*, not decoded: Adam7 interlacing rearranges
-    # the image into seven passes, and a decoder that ignores the flag produces a
-    # plausible-looking wrong image. Named so verify.sh knows what to expect, and
-    # given no .expected file, because there is no right answer to compare.
-    path = os.path.join(outdir, "refuse_interlaced.png")
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 1))
-        + chunk(b"IDAT", zlib.compress(b"\x00" * 40))
-        + chunk(b"IEND", b"")
-    )
-    with open(path, "wb") as f:
-        f.write(png)
-    made.append(path)
+    # Interlaced: seven passes on seven different lattices, each filtered as if it
+    # were an image of its own. Three sizes, because the edge cases are all about
+    # which passes are empty — an image narrower than 5 pixels has passes with no
+    # columns, and one 1 pixel tall has passes with no rows, and an empty pass
+    # contributes no bytes at all (not even a filter byte), which shifts every
+    # pass after it if a decoder assumes otherwise.
+    for (w, h, name) in [(9, 9, "interlaced_9x9.png"),
+                         (4, 4, "interlaced_4x4.png"),
+                         (1, 1, "interlaced_1x1.png")]:
+        made.append(interlaced_case(outdir, name, w, h))
 
     for p in made:
         print(os.path.basename(p))

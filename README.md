@@ -17,8 +17,8 @@ to take on trust.
 
 ## What it reads, and writes
 
-Non-interlaced PNGs: colour types 0 (grey), 2 (RGB), 3 (palette), 6 (RGBA), at 8
-or 16 bits a sample. The zlib stream is reassembled across IDAT chunks first,
+PNGs at 8 or 16 bits a sample, interlaced or not, in colour types 0 (grey),
+2 (RGB), 3 (palette) and 6 (RGBA). The zlib stream is reassembled across IDAT chunks first,
 which is not optional — encoders split it at arbitrary points, and a decoder that
 inflates each chunk on its own works on small files and fails on large ones.
 
@@ -32,9 +32,18 @@ sum, because DEFLATE does better on numbers near zero. Compression is `mgz`'s
 deflate, the chunk CRCs are `mgz`'s crc32, and the zlib Adler-32 is here — a PNG
 carries two different checksums and they are not interchangeable.
 
-**Interlaced (Adam7) files are refused**, not decoded. A decoder that ignores the
-flag produces a plausible-looking wrong image, which is worse than an error, so
-the refusal is a test case of its own.
+**Interlaced (Adam7) files decode.** An interlaced PNG is not one image but seven,
+each a subsampling on a different lattice, stored one after another and each
+filtered as if it were an image of its own — so the passes have different widths,
+which means different strides, which means the filters read different neighbours.
+The scatter back into one image is the only part that knows the file is
+interlaced; everything before it is the ordinary decoder, run seven times.
+
+The tests cover 9×9, 4×4 and 1×1, because the edge cases are all about **empty
+passes**: an image narrower than five pixels has passes with no columns, one a
+single pixel tall has passes with no rows, and an empty pass contributes no bytes
+at all — not even a filter byte — which shifts every later pass if a decoder
+assumes otherwise.
 
 16-bit output is reduced to the high byte of each sample. Since PNG samples are
 big-endian, that byte *is* the 8-bit value; doing better would mean choosing a

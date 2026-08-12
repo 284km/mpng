@@ -58,10 +58,19 @@ byte) and leaves as one, but the decoder converts to `Vec[int]` on the way in
 because it needs random access *and mutation*: reconstructing a scanline writes
 into the middle of a buffer, and `bytes` is immutable.
 
-So the boundary is cheap now and the middle still costs eight bytes a byte. What
-is missing is a mutable byte buffer — `StrBuf` is the shape, but it is a string
-builder, with the NUL problem that implies. That is a design question rather than
-an oversight, and it is the one this program would ask next.
+**Answered in mere v0.1.218**: `ByteBuf[R]`, a region-bound mutable byte buffer
+with random access — which is what a scanline needs, since it is reconstructed
+against the row above it and every byte written is read again. `StrBuf` was the
+right shape and the wrong element; `bytes` was the right element and immutable.
+
+Measured here, decoding a 736×724 RGBA PNG: peak RSS **164MB → 117MB**, with
+byte-identical output. The 2.1MB image had been 17MB of `int`s.
+
+Adding the type immediately re-found the region-tag bug of P5, twice and in both
+directions — once because `ByteBuf` was missing from the list of
+region-parameterised constructors, and once because a type whose C representation
+does not depend on its region should not carry the region in its tag at all. The
+second is now the rule for `StrBuf` too.
 
 ## P3 — the interpreter cannot run this on a real image
 

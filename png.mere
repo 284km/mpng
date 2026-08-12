@@ -167,23 +167,31 @@ let paeth = fn (a: int) -> fn (b: int) -> fn (c: int) ->
 
 // `raw` is the inflated stream: (1 + stride) bytes per scanline. The result is
 // the same rows with the filter bytes gone and the prediction undone.
-let unfilter = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
+//
+// The output is a `ByteBuf`: one byte per byte, and random access both ways,
+// which is what this needs — a row is reconstructed against the row above it,
+// already reconstructed, so every byte written is read again. A `Vec[R, int]`
+// does the same job at eight bytes a byte (see PAIN.md P2, which asked for this
+// type; it arrived in mere v0.1.218).
+// `start` is where in the inflated stream these scanlines begin — zero for an
+// ordinary image, and the running offset of a pass for an interlaced one.
+let unfilter_from = fn raw -> fn (start: int) -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
   let stride = width * bpp in
-  let out = new_vec (stride * height) 0 in
+  let out = bytebuf_new (stride * height) in
   let rec row = fn (y: int) ->
     if y == height then out
     else
-      let src = y * (stride + 1) in
+      let src = start + y * (stride + 1) in
       let ft = vec_get raw src in
       let dst = y * stride in
       let rec col = fn (x: int) ->
         if x == stride then ()
         else
           let cur = vec_get raw (src + 1 + x) in
-          let left = if x >= bpp then vec_get out (dst + x - bpp) else 0 in
-          let up = if y > 0 then vec_get out (dst - stride + x) else 0 in
+          let left = if x >= bpp then bytebuf_get out (dst + x - bpp) else 0 in
+          let up = if y > 0 then bytebuf_get out (dst - stride + x) else 0 in
           let upleft =
-            if y > 0 && x >= bpp then vec_get out (dst - stride + x - bpp) else 0 in
+            if y > 0 && x >= bpp then bytebuf_get out (dst - stride + x - bpp) else 0 in
           let v =
             if ft == 0 then cur
             else if ft == 1 then cur + left
@@ -191,31 +199,106 @@ let unfilter = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
             else if ft == 3 then cur + (left + up) / 2
             else if ft == 4 then cur + paeth left up upleft
             else cur in
-          let _ = vec_set out (dst + x) (bit_and v 255) in
+          let _ = bytebuf_set out (dst + x) v in
           col (x + 1) in
       let _ = col 0 in
       row (y + 1) in
   row 0;
 
-// Adam7 interlacing rearranges the image into seven passes of different
-// geometry. Nothing here handles it, and the important part is that a decoder
-// which ignores the flag produces a plausible-looking wrong image rather than an
-// error — so this is checked, and callers are expected to check it too.
+let unfilter = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
+  unfilter_from raw 0 width height bpp;
+
 let is_interlaced = fn data ->
   let h = read_header data in
   vec_len h == 5 && vec_get h 4 == 1;
 
+// --- Adam7 -----------------------------------------------------------------
+//
+// An interlaced PNG is not one image but seven, each a subsampling of it on a
+// different lattice, stored one after another and each filtered as if it were an
+// image of its own. Pass 1 is every eighth pixel of every eighth row; pass 7 is
+// every other pixel of the odd rows. So a decoder cannot treat the stream as
+// scanlines at all until it knows which pass it is in — and the passes have
+// different widths, which means different strides, which means the filters read
+// different neighbours.
+//
+// The tables are the standard ones: where each pass starts in x and y, and how
+// far it steps.
+let adam7_xstart = fn (p: int) ->
+  if p == 0 then 0 else if p == 1 then 4 else if p == 2 then 0
+  else if p == 3 then 2 else if p == 4 then 0 else if p == 5 then 1 else 0;
+let adam7_ystart = fn (p: int) ->
+  if p == 0 then 0 else if p == 1 then 0 else if p == 2 then 4
+  else if p == 3 then 0 else if p == 4 then 2 else if p == 5 then 0 else 1;
+let adam7_xstep = fn (p: int) ->
+  if p == 0 then 8 else if p == 1 then 8 else if p == 2 then 4
+  else if p == 3 then 4 else if p == 4 then 2 else if p == 5 then 2 else 1;
+let adam7_ystep = fn (p: int) ->
+  if p == 0 then 8 else if p == 1 then 8 else if p == 2 then 8
+  else if p == 3 then 4 else if p == 4 then 4 else if p == 5 then 2 else 2;
+
+// How many pixels/rows a pass has: the count of lattice points that land inside
+// the image. A pass with none of either is skipped entirely — it contributes no
+// bytes at all, not even a filter byte, which is the detail that shifts every
+// later pass if it is missed.
+let ceil_div = fn (a: int) -> fn (b: int) -> (a + b - 1) / b;
+let pass_width = fn (p: int) -> fn (width: int) ->
+  ceil_div (width - adam7_xstart p) (adam7_xstep p);
+let pass_height = fn (p: int) -> fn (height: int) ->
+  ceil_div (height - adam7_ystart p) (adam7_ystep p);
+
+// The seven passes, unfiltered in turn and scattered back into one image.
+//
+// Each pass is unfiltered *as its own image* — its own stride, its own first row
+// with no row above — and then its pixels are written to where they belong. The
+// scatter is the only part that knows the image is interlaced; everything before
+// it is the ordinary decoder run seven times.
+let deinterlace = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
+  let out = bytebuf_new (width * height * bpp) in
+  let rec pass = fn (p: int) -> fn (off: int) ->
+    if p == 7 then out
+    else
+      let pw = pass_width p width in
+      let ph = pass_height p height in
+      if pw <= 0 || ph <= 0 then pass (p + 1) off
+      else
+        let sub = unfilter_from raw off pw ph bpp in
+        let rec place = fn (y: int) ->
+          if y == ph then ()
+          else
+            let rec px = fn (x: int) ->
+              if x == pw then ()
+              else
+                let sx = adam7_xstart p + x * adam7_xstep p in
+                let sy = adam7_ystart p + y * adam7_ystep p in
+                let src = (y * pw + x) * bpp in
+                let dst = (sy * width + sx) * bpp in
+                let rec byte = fn (k: int) ->
+                  if k == bpp then ()
+                  else
+                    let _ = bytebuf_set out (dst + k) (bytebuf_get sub (src + k)) in
+                    byte (k + 1) in
+                let _ = byte 0 in
+                px (x + 1) in
+            let _ = px 0 in
+            place (y + 1) in
+        let _ = place 0 in
+        // Each pass costs one filter byte per row plus its own stride.
+        pass (p + 1) (off + ph * (pw * bpp + 1)) in
+  pass 0 0;
+
 // Raw pixel bytes: `pixel_bytes` per pixel, row-major, filters undone.
 let decode = fn data ->
   let h = read_header data in
-  if vec_len h == 0 then vec_new ()
+  if vec_len h == 0 then bytebuf_new 0
   else
     let width = vec_get h 0 in
     let height = vec_get h 1 in
     let bpp = pixel_bytes (vec_get h 3) (vec_get h 2) in
     // zlib: two bytes of header, then the DEFLATE stream mgz knows how to read.
     let raw = inflate (idat_bytes data) 2 in
-    unfilter raw width height bpp;
+    if vec_get h 4 == 1 then deinterlace raw width height bpp
+    else unfilter raw width height bpp;
 
 // Three bytes a pixel, whatever the file was: grey expanded, alpha dropped,
 // palette looked up, and a 16-bit sample reduced to its high byte.
@@ -238,7 +321,7 @@ let rgb8 = fn data ->
     if i == width * height then out
     else
       let p = i * bpp in
-      let s0 = vec_get pixels p in
+      let s0 = bytebuf_get pixels p in
       let _ =
         if colour == 3 then
           // An index into PLTE. An index past the end of the table is a broken
@@ -258,7 +341,7 @@ let rgb8 = fn data ->
           vec_push out s0
         else
           let _ = vec_push out s0 in
-          let _ = vec_push out (vec_get pixels (p + step)) in
-          vec_push out (vec_get pixels (p + step * 2)) in
+          let _ = vec_push out (bytebuf_get pixels (p + step)) in
+          vec_push out (bytebuf_get pixels (p + step * 2)) in
       go (i + 1) in
   go 0;

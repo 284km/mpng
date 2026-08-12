@@ -86,7 +86,7 @@ let new_vec = fn (n: int) -> fn (x: int) -> ...
 middle of a buffer. This is the fourth dogfood in this project to open with those
 four lines (`memu`, `mkv`, `mgz`, this one).
 
-## P5 — the C backend emits a closure type name it never defines
+## P5 — the C backend emits a closure type name it never defines — **fixed upstream**
 
 Twelve lines:
 
@@ -126,7 +126,7 @@ The workaround is to capture the accumulator instead of threading it through the
 recursion, which is better code anyway — it is a mutable buffer, not a value being
 passed along. `read_ppm` in `mpng.mere` says so where it does it.
 
-## P6 — a lifted inner function loses a capture when the name is used elsewhere
+## P6 — a lifted inner function loses a capture when the name is used elsewhere — **fixed upstream**
 
 Found immediately after P5, in the same file. `filter_row` takes a parameter
 called `row`; so do `row_cost` and `best_filter`, and `encode_rgb8` has a local
@@ -147,6 +147,21 @@ inner fns — evidently *parameters* of sibling functions were not covered.
 Both of these were found by `CC_CHECK=1`, which compiles the program and runs the
 result. Neither is visible on the interpreter, and neither is visible from reading
 the emitted C without a compiler.
+
+**Both fixed in mere v0.1.217**, and the causes were worth the trip:
+
+- P6 was a restore that had been written and then discarded — `let _ = known_before
+  in`, where `known_before` was already being taken two lines above. A `let rec`'s
+  names leaked into every *later* top-level function, so a parameter of the same
+  name was taken for one of them. Seeing it needed two files and a name in common,
+  which is why it had survived: neither file reproduces it alone.
+- P5 was `ty_tag` erasing an unresolved type variable to `int` — right for a value
+  nothing inspects, wrong for a *region marker*, since the typedef for the same
+  type was emitted from a copy where the region had resolved to `__heap`. An
+  unresolved marker now tags as the default region.
+
+This program keeps its workarounds anyway: `line` instead of `row` reads better,
+and capturing the accumulator instead of threading it is better code.
 \n## What went well, and is worth saying
 
 **`mgz` as a package worked on the first try.** `mere install` fetched it at a

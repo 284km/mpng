@@ -64,19 +64,20 @@ let paeth_e = fn (a: int) -> fn (b: int) -> fn (c: int) ->
 // One filtered scanline, for a given filter type. `line` and `prev` are the
 // unfiltered bytes; `prev` is empty for the first row.
 //
-// The parameter is `line` and not `row` for a reason that is not style: with
-// three functions in this file taking a parameter called `row`, the C backend's
+// The parameter is `line` and not `row` because of a bug it used to trip: with a
+// `let rec row` in png.mere and a parameter called `row` here, the C backend's
 // inner-function lifting left `row` out of this one's capture list and emitted a
-// body referring to an identifier it never declared. See PAIN.md P6. Renaming it
-// is a workaround for a bug in name-keyed capture resolution, not a preference.
-let filter_row = fn (kind: int) -> fn line -> fn prev -> fn (bpp: int) ->
-  let n = vec_len line in
+// body referring to an identifier it never declared. Fixed upstream in mere
+// v0.1.217 (see PAIN.md P6); the name stays because two things called `row` in
+// one program is worth avoiding anyway.
+let filter_row = fn (kind: int) -> fn row -> fn prev -> fn (bpp: int) ->
+  let n = vec_len row in
   let out = vec_new () in
   let rec go = fn (i: int) ->
     if i == n then out
     else
-      let cur = vec_get line i in
-      let left = if i >= bpp then vec_get line (i - bpp) else 0 in
+      let cur = vec_get row i in
+      let left = if i >= bpp then vec_get row (i - bpp) else 0 in
       let up = if vec_len prev > 0 then vec_get prev i else 0 in
       let upleft = if vec_len prev > 0 && i >= bpp then vec_get prev (i - bpp) else 0 in
       let v =

@@ -47,6 +47,13 @@ jobs:
           opam install . --deps-only
           opam exec -- dune build bin/mere.exe
 
+      # `.mere_modules/` is gitignored here and mere.toml declares mgz, so the
+      # deps have to be fetched. Verifying locally with an already-populated
+      # module directory is what hid this: CI had no such directory and every
+      # decode failed on `import "mgz/inflate.mere"`.
+      - name: Fetch dependencies
+        run: .mere-compiler/_build/default/bin/mere.exe install
+
       # MEASURED before wiring it: 5 seconds, ending "verify: 23 passed, 0 failed".
       - name: verify.sh
         run: MERE="$GITHUB_WORKSPACE/.mere-compiler/_build/default/bin/mere.exe" sh verify.sh

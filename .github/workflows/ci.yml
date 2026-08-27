@@ -1,0 +1,52 @@
+name: CI
+
+# WHY THIS EXISTS. This repository had no CI, and neither did any of the ~36
+# programs written in Mere. The compiler's own CI checks that its `main` still
+# TYPES this code (merelang/mere, test/downstream/REPOS) -- but "is it still a
+# program" and "do its gates still pass" are different questions, and only the
+# second one can see this repository rotting on its own.
+#
+# The expected PPMs are derived from the same numbers the PNGs were built from, not from a previous run of this decoder -- so this is a check and not a demo, and it is worth running on a machine that is not the author's.
+
+on:
+  push:
+  pull_request:
+  # The compiler moves daily and this repository does not, so a weekly run
+  # catches the case where nothing here changed and it broke anyway.
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # BUILT FROM main, NOT FROM THE LATEST RELEASE. This repository is
+      # developed against the compiler as it is, and the last tag has been
+      # dozens of versions behind main. The cost is that a break upstream
+      # reddens this repository too -- which is the truth of the dependency,
+      # and merelang/mere's downstream_check tells the two apart from the
+      # other side.
+      - name: Check out the Mere compiler
+        uses: actions/checkout@v5
+        with:
+          repository: merelang/mere
+          path: .mere-compiler
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.1"
+
+      - name: Build mere
+        run: |
+          cd .mere-compiler
+          opam install . --deps-only
+          opam exec -- dune build bin/mere.exe
+
+      # MEASURED before wiring it: 5 seconds, ending "verify: 23 passed, 0 failed".
+      - name: verify.sh
+        run: MERE="$GITHUB_WORKSPACE/.mere-compiler/_build/default/bin/mere.exe" sh verify.sh

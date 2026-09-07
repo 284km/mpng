@@ -129,6 +129,18 @@ png = (b"\x89PNG\r\n\x1a\n"
        + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 open(sys.argv[1] + "/ancillary.png", "wb").write(png)
 ANC
+# tRNS: the BYTES and not just the presence of the chunk. It is shorter than the
+# palette on purpose -- RFC 2083 makes every entry past its end opaque -- so a
+# decoder that reads one alpha per palette entry regardless walks off the chunk.
+tr=$("$MERE" "$DIR/mpng.mere" info "$TMP/palette_trns.png")
+if printf '%s' "$tr" | grep -q '+tRNS\[0,128,255\]'; then
+  printf '  ok    tRNS is read back byte for byte\n'
+  pass=$((pass + 1))
+else
+  printf '  FAIL  tRNS was not reported correctly: %s\n' "$tr"
+  fail=$((fail + 1))
+fi
+
 anc=$("$MERE" "$DIR/mpng.mere" info "$TMP/ancillary.png")
 if printf '%s' "$anc" | grep -q "gamma 45455" && printf '%s' "$anc" | grep -q "Author: Somebody"; then
   printf '  ok    gAMA and tEXt are read and reported\n'

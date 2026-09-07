@@ -193,6 +193,43 @@ def packed_case(outdir, name, width, height, colour, depth, filters, plte=None):
     return path
 
 
+def trns_palette_case(outdir, name, width, height):
+    """A palette PNG with a tRNS chunk covering only part of the palette.
+
+    The expected output here is a PPM with FOUR bytes a pixel is not a thing, so what is
+    checked is the RGB the decoder produces -- and mpng's `rgb8` drops alpha, so the
+    colours must be unchanged by the presence of the chunk. That is the point: reading
+    tRNS must not disturb the colour path, and `trns` must hand back exactly the bytes
+    the file holds for a caller that needs the alpha (m3d's texture loader does, for
+    glTF's MASK alpha mode).
+    """
+    plte = bytes([(i * 41 + 3) % 256 for i in range(6 * 3)])
+    alphas = bytes([0, 128, 255])          # shorter than the palette, on purpose
+    rows = [[(x + y) % 6 for x in range(width)] for y in range(height)]
+    raw = b""
+    prev = None
+    for y, r in enumerate(rows):
+        flat = bytes(r)
+        raw += filter_scanline(y % 5, flat, prev, 1)
+        prev = flat
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 3, 0, 0, 0))
+           + chunk(b"PLTE", plte)
+           + chunk(b"tRNS", alphas)
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    path = os.path.join(outdir, name)
+    with open(path, "wb") as f:
+        f.write(png)
+    out = bytearray(f"P6\n{width} {height}\n255\n".encode())
+    for r in rows:
+        for v in r:
+            out += bytes(plte[v * 3:v * 3 + 3])
+    with open(expected_path(path), "wb") as f:
+        f.write(out)
+    return path
+
+
 def refuse_case(outdir, name, width, height, colour, depth):
     """A file whose IHDR names a colour/depth pair RFC 2083 does not define.
 
@@ -303,6 +340,15 @@ def main():
                                 [0, 1, 2, 3, 4]))
         made.append(packed_case(outdir, f"palette{depth}bit.png", 13, 4, 3, depth,
                                 [0, 1, 2, 3, 4], plte=plte16[: (1 << depth) * 3]))
+
+    # tRNS: a palette with SOME entries transparent, which is how a masked cutout
+    # arrives. The alpha byte per entry is what a decoder has to look up alongside the
+    # colour; treating a palette image as opaque draws the holes.
+    #
+    # The chunk is DELIBERATELY SHORTER THAN THE PALETTE -- 3 of 6 entries -- because
+    # RFC 2083 says every entry past its end is opaque, and a decoder that reads one
+    # alpha per palette entry regardless walks off the chunk.
+    made.append(trns_palette_case(outdir, "palette_trns.png", 7, 5))
 
     # The first input this gate's `refuse_` branch has ever had: RGB at 4 bits is not a
     # PNG, and there is no picture to decode it into.

@@ -24,6 +24,8 @@
 //   text_chunks  data          -> vec   tEXt chunks as "keyword: text"
 //   gamma        data          -> int   gAMA in hundred-thousandths, 0 if absent
 //   has_transparency data      -> bool  is there a tRNS chunk
+//   trns         data          -> vec   tRNS's raw bytes (empty if none); what they
+//                                        mean depends on the colour type
 //   rgb8         data          -> vec   three bytes a pixel, whatever the file was
 
 import "mgz/inflate.mere";
@@ -255,6 +257,33 @@ let gamma = fn data ->
       let len = u32be data pos in
       if is_iend data (pos + 4) then 0
       else if is_gama data (pos + 4) then u32be data (pos + 8)
+      else walk (pos + 12 + len) in
+  walk 8;
+
+// tRNS, as its raw bytes. WHAT THEY MEAN DEPENDS ON THE COLOUR TYPE, and the
+// three meanings are not variations of one:
+//
+//   palette (3): one ALPHA BYTE PER PALETTE ENTRY, in order, and the chunk may be
+//                shorter than the palette -- every entry past its end is opaque.
+//   grey (0):    a two-byte SAMPLE VALUE that is fully transparent (a colour key).
+//   RGB (2):     three two-byte sample values, the same way.
+//
+// It is returned raw rather than expanded because expanding it needs the colour
+// type, and a function that took the colour type would be deciding for its
+// caller which of the three questions it is asking.
+let trns = fn data ->
+  let out = vec_new () in
+  let n = vec_len data in
+  let rec walk = fn (pos: int) ->
+    if pos + 8 > n then out
+    else
+      let len = u32be data pos in
+      if is_iend data (pos + 4) then out
+      else if is_trns data (pos + 4) then
+        let rec copy = fn (i: int) ->
+          if i >= len then out
+          else let _ = vec_push out (vec_get data (pos + 8 + i)) in copy (i + 1) in
+        copy 0
       else walk (pos + 12 + len) in
   walk 8;
 

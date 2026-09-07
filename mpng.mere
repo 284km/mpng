@@ -27,7 +27,17 @@ let info = fn data ->
              ++ " " ++ str_of_int (vec_get h 2) ++ "-bit "
              ++ colour_name (vec_get h 3)
              ++ (if vec_get h 4 == 1 then " interlaced" else "")
-             ++ (if has_transparency data then " +tRNS" else "")
+             // The tRNS BYTES, not just its presence. A caller that needs the alpha
+             // -- glTF's MASK mode does -- gets them from `trns`, and "there is a
+             // chunk" is not a check on what the chunk says.
+             ++ (if has_transparency data then
+                   let tb = trns data in
+                   let rec join = fn (i: int) -> fn (acc: str) ->
+                     if i >= vec_len tb then acc
+                     else join (i + 1) (acc ++ (if i == 0 then "" else ",")
+                                        ++ str_of_int (vec_get tb i)) in
+                   " +tRNS[" ++ join 0 "" ++ "]"
+                 else "")
              ++ (if g > 0 then " gamma " ++ str_of_int g else "")) in
     // The ancillary text, if any: a keyword and a string, which is where a PNG
     // keeps who made it and when.

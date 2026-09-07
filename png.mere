@@ -16,7 +16,9 @@
 // Exports:
 //   is_png       data          -> bool
 //   read_header  data          -> vec   [width, height, depth, colour, interlace]
-//   decode       data          -> vec   raw pixel bytes, filters undone
+//   decode       data          -> vec   raw pixel SAMPLES, one byte each (two at
+//                                        16 bits), filters undone and any packing
+//                                        below 8 bits expanded
 //   channels     colour_type   -> int
 //   palette      data          -> vec   PLTE as r,g,b triples (empty if none)
 //   text_chunks  data          -> vec   tEXt chunks as "keyword: text"
@@ -110,11 +112,61 @@ let channels = fn (colour: int) ->
   else if colour == 6 then 4
   else 0;
 
-// Bytes per pixel, which is what the filters work in: a 16-bit sample is two
-// bytes, and `left` means two bytes further back. Getting this wrong decodes
-// 8-bit images perfectly and 16-bit ones into noise.
+// Bytes per pixel IN THE DECODED OUTPUT, which is one byte a sample except at
+// 16 bits, where it is two. This is the stride every consumer of `decode` uses.
+//
+// It is NOT the stride of the bytes in the file. Below 8 bits a scanline is
+// PACKED -- two 4-bit samples to a byte, eight 1-bit ones -- and `decode`
+// expands them, so this number describes what comes out and `scanline_bytes`
+// describes what went in. Those were the same function once, and the result was
+// that a 4-bit palette image made the decoder read twice as many bytes per row
+// as the row had: 1000 pixels at 4 bits is 500 bytes, the loop asked for 1000,
+// and it ran off the end of the last row by exactly the number of filter bytes
+// it had skipped. Two of Khronos's glTF sample models are 4-bit palettes.
 let pixel_bytes = fn (colour: int) -> fn (depth: int) ->
   channels colour * (if depth == 16 then 2 else 1);
+
+// Bits a pixel, straight from the header: samples times their width.
+let bits_per_pixel = fn (colour: int) -> fn (depth: int) -> channels colour * depth;
+
+// The bytes one scanline occupies IN THE FILE, rounded up -- a row of 3 pixels
+// at 1 bit is one byte with five bits of padding, and the padding is not carried
+// over into the next row.
+let scanline_bytes = fn (colour: int) -> fn (depth: int) -> fn (width: int) ->
+  (width * bits_per_pixel colour depth + 7) / 8;
+
+// How far back `left` is, for the filters. RFC 2083 says: the number of bytes
+// per pixel, ROUNDED UP, and at least one -- so every depth below 8 uses 1, and
+// the filters at those depths work on bytes that hold several pixels each. That
+// is the specification's choice, not a simplification of it.
+let filter_step = fn (colour: int) -> fn (depth: int) ->
+  let b = (bits_per_pixel colour depth + 7) / 8 in
+  if b < 1 then 1 else b;
+
+// Which bit depths each colour type may have (RFC 2083 table, 11.2.2). A file
+// outside this table is broken rather than exotic, and decoding it would mean
+// inventing a meaning for a combination the format does not define.
+let depth_ok = fn (colour: int) -> fn (depth: int) ->
+  if colour == 0 then depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16
+  else if colour == 3 then depth == 1 || depth == 2 || depth == 4 || depth == 8
+  else if colour == 2 || colour == 4 || colour == 6 then depth == 8 || depth == 16
+  else false;
+
+let check_depth = fn (colour: int) -> fn (depth: int) ->
+  if depth_ok colour depth then ()
+  else fail ("png: colour type " ++ str_of_int colour ++ " with bit depth "
+             ++ str_of_int depth ++ " is not supported -- RFC 2083 does not define it");
+
+// One sample out of a PACKED row, by index. `depth` is 1, 2 or 4, so a byte
+// holds 8, 4 or 2 of them, MOST SIGNIFICANT FIRST -- the opposite order from
+// DEFLATE's bits, which is the second place this format carries both
+// conventions.
+let packed_sample = fn row -> fn (at: int) -> fn (depth: int) -> fn (i: int) ->
+  let per = 8 / depth in
+  let b = bytebuf_get row (at + i / per) in
+  let shift = 8 - depth * (i % per + 1) in
+  let rec pow2 = fn (n: int) -> if n <= 0 then 1 else 2 * pow2 (n - 1) in
+  (b / pow2 shift) % pow2 depth;
 
 // PLTE, as r,g,b triples. Empty when the file has none, which is every colour
 // type but 3.
@@ -243,23 +295,33 @@ let paeth = fn (a: int) -> fn (b: int) -> fn (c: int) ->
 // type; it arrived in mere v0.1.218).
 // `start` is where in the inflated stream these scanlines begin — zero for an
 // ordinary image, and the running offset of a pass for an interlaced one.
-let unfilter_from = fn raw -> fn (start: int) -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
-  let stride = width * bpp in
-  let out = bytebuf_new (stride * height) in
+// THE FILTERS RUN ON THE FILE'S BYTES, NOT ON PIXELS. That distinction is the
+// whole of what this function has to get right below 8 bits: the reconstruction
+// works in PACKED bytes at `pline` a row, stepping `fstep` back for `left`, and
+// only afterwards are the samples spread out one to a byte.
+//
+// Doing it the other way round -- expanding first and filtering the expansion --
+// decodes an 8-bit image perfectly and every 4-bit one into noise, because
+// `left` would then be a different byte from the one the encoder subtracted.
+let unfilter_at = fn raw -> fn (start: int) -> fn (colour: int) -> fn (depth: int) ->
+                  fn (width: int) -> fn (height: int) ->
+  let pline = scanline_bytes colour depth width in
+  let fstep = filter_step colour depth in
+  let packed = bytebuf_new (pline * height) in
   let rec row = fn (y: int) ->
-    if y == height then out
+    if y == height then ()
     else
-      let src = start + y * (stride + 1) in
+      let src = start + y * (pline + 1) in
       let ft = vec_get raw src in
-      let dst = y * stride in
+      let dst = y * pline in
       let rec col = fn (x: int) ->
-        if x == stride then ()
+        if x == pline then ()
         else
           let cur = vec_get raw (src + 1 + x) in
-          let left = if x >= bpp then bytebuf_get out (dst + x - bpp) else 0 in
-          let up = if y > 0 then bytebuf_get out (dst - stride + x) else 0 in
+          let left = if x >= fstep then bytebuf_get packed (dst + x - fstep) else 0 in
+          let up = if y > 0 then bytebuf_get packed (dst - pline + x) else 0 in
           let upleft =
-            if y > 0 && x >= bpp then bytebuf_get out (dst - stride + x - bpp) else 0 in
+            if y > 0 && x >= fstep then bytebuf_get packed (dst - pline + x - fstep) else 0 in
           let v =
             if ft == 0 then cur
             else if ft == 1 then cur + left
@@ -267,14 +329,42 @@ let unfilter_from = fn raw -> fn (start: int) -> fn (width: int) -> fn (height: 
             else if ft == 3 then cur + (left + up) / 2
             else if ft == 4 then cur + paeth left up upleft
             else cur in
-          let _ = bytebuf_set out (dst + x) v in
+          let _ = bytebuf_set packed (dst + x) v in
           col (x + 1) in
       let _ = col 0 in
       row (y + 1) in
-  row 0;
+  let _ = row 0 in
+  if depth >= 8 then packed
+  else
+    // One sample to a byte, VALUES UNCHANGED. A 4-bit palette sample is an index
+    // into PLTE and must stay 0..15; a 4-bit grey sample is a level out of 15 and
+    // wants scaling to 0..255, but that is a decision about DISPLAY and it
+    // belongs in `rgb8`, not in a function that promises raw samples.
+    //
+    // The row's trailing padding bits are dropped here rather than carried: a
+    // scanline is padded to a byte and the next one starts fresh, so a decoder
+    // that treats the stream as one long bit sequence drifts by a fraction of a
+    // byte per row and produces a picture that shears.
+    let nch = channels colour in
+    let out = bytebuf_new (width * nch * height) in
+    let rec erow = fn (y: int) ->
+      if y == height then out
+      else
+        let rec es = fn (i: int) ->
+          if i == width * nch then ()
+          else
+            let _ = bytebuf_set out (y * width * nch + i)
+                                   (packed_sample packed (y * pline) depth i) in
+            es (i + 1) in
+        let _ = es 0 in
+        erow (y + 1) in
+    erow 0;
 
-let unfilter = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
-  unfilter_from raw 0 width height bpp;
+// `bpp` ALONE CANNOT SAY WHICH COLOUR TYPE IT CAME FROM -- two bytes a pixel is
+// 16-bit grey or 8-bit grey-with-alpha, and the filters step differently for
+// each -- so nothing here takes one. The callers pass the header's own numbers.
+let unfilter = fn raw -> fn (colour: int) -> fn (depth: int) -> fn (width: int) -> fn (height: int) ->
+  unfilter_at raw 0 colour depth width height;
 
 let is_interlaced = fn data ->
   let h = read_header data in
@@ -321,7 +411,9 @@ let pass_height = fn (p: int) -> fn (height: int) ->
 // with no row above — and then its pixels are written to where they belong. The
 // scatter is the only part that knows the image is interlaced; everything before
 // it is the ordinary decoder run seven times.
-let deinterlace = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int) ->
+let deinterlace = fn raw -> fn (colour: int) -> fn (depth: int) ->
+                  fn (width: int) -> fn (height: int) ->
+  let bpp = pixel_bytes colour depth in
   let out = bytebuf_new (width * height * bpp) in
   let rec pass = fn (p: int) -> fn (off: int) ->
     if p == 7 then out
@@ -330,7 +422,10 @@ let deinterlace = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int)
       let ph = pass_height p height in
       if pw <= 0 || ph <= 0 then pass (p + 1) off
       else
-        let sub = unfilter_from raw off pw ph bpp in
+        // Each pass is unfiltered at ITS OWN WIDTH, which below 8 bits means its
+        // own packing and its own trailing padding -- a pass 3 pixels wide at 4
+        // bits occupies 2 bytes a row, not 1.5.
+        let sub = unfilter_at raw off colour depth pw ph in
         let rec place = fn (y: int) ->
           if y == ph then ()
           else
@@ -351,8 +446,8 @@ let deinterlace = fn raw -> fn (width: int) -> fn (height: int) -> fn (bpp: int)
             let _ = px 0 in
             place (y + 1) in
         let _ = place 0 in
-        // Each pass costs one filter byte per row plus its own stride.
-        pass (p + 1) (off + ph * (pw * bpp + 1)) in
+        // Each pass costs one filter byte per row plus its own PACKED stride.
+        pass (p + 1) (off + ph * (scanline_bytes colour depth pw + 1)) in
   pass 0 0;
 
 // Raw pixel bytes: `pixel_bytes` per pixel, row-major, filters undone.
@@ -362,11 +457,13 @@ let decode = fn data ->
   else
     let width = vec_get h 0 in
     let height = vec_get h 1 in
-    let bpp = pixel_bytes (vec_get h 3) (vec_get h 2) in
+    let depth = vec_get h 2 in
+    let colour = vec_get h 3 in
+    let _ = check_depth colour depth in
     // zlib: two bytes of header, then the DEFLATE stream mgz knows how to read.
     let raw = inflate (idat_bytes data) 2 in
-    if vec_get h 4 == 1 then deinterlace raw width height bpp
-    else unfilter raw width height bpp;
+    if vec_get h 4 == 1 then deinterlace raw colour depth width height
+    else unfilter raw colour depth width height;
 
 // Three bytes a pixel, whatever the file was: grey expanded, alpha dropped,
 // palette looked up, and a 16-bit sample reduced to its high byte.
@@ -384,17 +481,29 @@ let rgb8 = fn data ->
   let step = if depth == 16 then 2 else 1 in
   let pixels = decode data in
   let pal = palette data in
+  // A GREY SAMPLE BELOW 8 BITS IS A LEVEL OUT OF ITS OWN MAXIMUM, so 4-bit grey
+  // runs 0..15 and has to be scaled to 0..255 to mean the same brightness. The
+  // scaling is 255/(2^d - 1), which is exact for every depth PNG allows -- 1 bit
+  // scales by 255, 2 by 85, 4 by 17 -- so it is a multiply and not a rounding
+  // question. A decoder that skips it produces an image that is technically
+  // right and visibly almost black.
+  //
+  // A PALETTE SAMPLE IS NOT SCALED. It is an index, and multiplying an index by
+  // 17 looks up the wrong colour.
+  let gscale =
+    if colour == 3 || depth >= 8 then 1
+    else if depth == 1 then 255 else if depth == 2 then 85 else 17 in
   let out = vec_new () in
   let rec go = fn (i: int) ->
     if i == width * height then out
     else
       let p = i * bpp in
-      let s0 = bytebuf_get pixels p in
+      let s0 = bytebuf_get pixels p * gscale in
       let _ =
         if colour == 3 then
           // An index into PLTE. An index past the end of the table is a broken
           // file; black is a better answer than a crash.
-          let e = s0 * 3 in
+          let e = bytebuf_get pixels p * 3 in
           if e + 2 < vec_len pal then
             let _ = vec_push out (vec_get pal e) in
             let _ = vec_push out (vec_get pal (e + 1)) in
@@ -408,7 +517,11 @@ let rgb8 = fn data ->
           let _ = vec_push out s0 in
           vec_push out s0
         else
-          let _ = vec_push out s0 in
+          // Colour types 2 and 6 are 8- or 16-bit only, so `gscale` is 1 here by
+          // construction; the raw samples are read directly rather than relying
+          // on that, because a scaled red beside two unscaled others is the kind
+          // of asymmetry that survives every test until the day it does not.
+          let _ = vec_push out (bytebuf_get pixels p) in
           let _ = vec_push out (bytebuf_get pixels (p + step)) in
           vec_push out (bytebuf_get pixels (p + step * 2)) in
       go (i + 1) in

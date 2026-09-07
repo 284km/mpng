@@ -127,6 +127,93 @@ def case(outdir, name, width, height, colour, filters, split_idat=False,
     return path
 
 
+def packed_case(outdir, name, width, height, colour, depth, filters, plte=None):
+    """A PNG at 1, 2 or 4 bits a sample, with the expected PPM computed alongside.
+
+    BELOW 8 BITS A SCANLINE IS PACKED and the filters run on the packed bytes, not on
+    pixels — `left` is one byte back, which at 4 bits is two pixels back. So the packing
+    is done here by hand: an encoder that packed for us would be deciding what is being
+    tested, and the thing being tested is exactly whether the decoder agrees about where
+    a sample sits inside a byte.
+
+    Each row is padded to a whole byte and the next row starts fresh, so a decoder that
+    treats the stream as one long bit sequence shears the image by a fraction of a byte
+    per row. That only shows up when `width * depth` is not a multiple of 8, which is why
+    the widths below are odd.
+    """
+    nch = {0: 1, 3: 1}[colour]              # only grey and palette go below 8 bits
+    per_byte = 8 // depth
+    maxv = (1 << depth) - 1
+    rows = [[(x * 7 + y * 5) % (maxv + 1) for x in range(width * nch)]
+            for y in range(height)]
+    if colour == 3:
+        rows = [[v % (len(plte) // 3) for v in r] for r in rows]
+
+    def pack(vals):
+        out = bytearray()
+        for i in range(0, len(vals), per_byte):
+            b = 0
+            for k in range(per_byte):
+                v = vals[i + k] if i + k < len(vals) else 0
+                b |= (v & maxv) << (8 - depth * (k + 1))
+            out.append(b)
+        return bytes(out)
+
+    raw = b""
+    prev = None
+    for y, r in enumerate(rows):
+        flat = pack(r)
+        raw += filter_scanline(filters[y % len(filters)], flat, prev, 1)
+        prev = flat
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, depth, colour, 0, 0, 0))
+           + (chunk(b"PLTE", plte) if plte else b"")
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    path = os.path.join(outdir, name)
+    with open(path, "wb") as f:
+        f.write(png)
+
+    # A GREY LEVEL IS OUT OF ITS OWN MAXIMUM, so it scales by 255/maxv — exact at every
+    # depth PNG allows. A PALETTE INDEX DOES NOT SCALE; multiplying an index by 17 looks
+    # up a different colour. Getting these two the same way round is most of the point of
+    # having both cases.
+    out = bytearray(f"P6\n{width} {height}\n255\n".encode())
+    for r in rows:
+        for x in range(width):
+            v = r[x]
+            if colour == 3:
+                e = v * 3
+                out += bytes(plte[e:e + 3]) if e + 3 <= len(plte) else b"\0\0\0"
+            else:
+                g = v * (255 // maxv)
+                out += bytes([g, g, g])
+    with open(expected_path(path), "wb") as f:
+        f.write(out)
+    return path
+
+
+def refuse_case(outdir, name, width, height, colour, depth):
+    """A file whose IHDR names a colour/depth pair RFC 2083 does not define.
+
+    There is no right picture for this, so what is checked is that mpng SAYS SO rather
+    than decoding it into something plausible. verify.sh has had a `refuse_` branch since
+    it was written and this is the first case to reach it — an arm of a gate with no
+    input is not a check, it is a place where one could go.
+    """
+    nch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[colour]
+    raw = b"".join(b"\x00" + bytes((x * 13 + y) % 256 for x in range(width * nch))
+                   for y in range(height))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, depth, colour, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    path = os.path.join(outdir, name)
+    with open(path, "wb") as f:
+        f.write(png)
+    return path
+
+
 ADAM7 = [  # (xstart, ystart, xstep, ystep)
     (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
     (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2),
@@ -202,6 +289,25 @@ def main():
                          (4, 4, "interlaced_4x4.png"),
                          (1, 1, "interlaced_1x1.png")]:
         made.append(interlaced_case(outdir, name, w, h))
+
+    # BELOW 8 BITS A SCANLINE IS PACKED, and its byte width is not width * channels.
+    # A decoder that computes the stride the 8-bit way reads twice as many bytes per row
+    # as a 4-bit row has and runs off the end of the image -- which is what happened, on
+    # two of Khronos's glTF sample models, both 4-bit palettes.
+    #
+    # The widths are deliberately NOT multiples of the samples-per-byte, so each row has
+    # padding bits that must be dropped rather than carried into the next row.
+    plte16 = bytes([(i * 13 + 7) % 256 for i in range(16 * 3)])
+    for depth in (1, 2, 4):
+        made.append(packed_case(outdir, f"grey{depth}bit.png", 11, 5, 0, depth,
+                                [0, 1, 2, 3, 4]))
+        made.append(packed_case(outdir, f"palette{depth}bit.png", 13, 4, 3, depth,
+                                [0, 1, 2, 3, 4], plte=plte16[: (1 << depth) * 3]))
+
+    # The first input this gate's `refuse_` branch has ever had: RGB at 4 bits is not a
+    # PNG, and there is no picture to decode it into.
+    made.append(refuse_case(outdir, "refuse_rgb_4bit.png", 4, 3, 2, 4))
+    made.append(refuse_case(outdir, "refuse_palette_16bit.png", 4, 3, 3, 16))
 
     for p in made:
         print(os.path.basename(p))

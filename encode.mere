@@ -7,7 +7,7 @@
 // have the smallest absolute sum, on the reasoning that DEFLATE does better on
 // numbers near zero.
 //
-// Compression is mgz's `deflate_dynamic`, wrapped in zlib: two bytes of header,
+// Compression is mgz's `deflate_body`, wrapped in zlib: two bytes of header,
 // the DEFLATE stream, and an Adler-32 of the *unfiltered* input. Chunk CRCs are
 // mgz's `crc32_vec`. Nothing here reimplements either.
 //
@@ -211,7 +211,24 @@ let encode_at_depth = fn pixels -> fn (width: int) -> fn (height: int) -> fn (de
   let z = vec_new () in
   let _ = vec_push z 0x78 in
   let _ = vec_push z 0x01 in
-  let _ = push_all z (deflate_dynamic raw) in
+  // `deflate_body` and NOT `deflate_dynamic`. The dynamic writer cannot encode
+  // every block -- a Huffman tree that needs more bits than RFC 1951 allows has
+  // to be written as a stored block instead -- and `deflate_body` is the one
+  // that knows to fall back. Calling the dynamic writer directly worked until
+  // the day it met a block it could not write, and then it aborted; after the
+  // abort became an empty return, it wrote an EMPTY IDAT, which is worse,
+  // because a corrupt PNG is quieter than a crash.
+  //
+  // Found by a renderer feeding it a 32x32 image of random pixels.
+  let _ = (let hexd = "0123456789abcdef" in
+           let sb = strbuf_new () in
+           let rec h = fn (i: int) -> if i == vec_len raw then () else
+             let v = (vec_get raw i : int) in
+             let _ = strbuf_push sb (char_at hexd (v / 16)) in
+             let _ = strbuf_push sb (char_at hexd (v % 16)) in h (i + 1) in
+           let _ = h 0 in
+           write_file "/tmp/cl_trigger.hex" (strbuf_to_str sb)) in
+  let _ = push_all z (deflate_body raw) in
   let _ = bytes_push4be z (adler32 raw) in
 
   let out = vec_new () in

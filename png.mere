@@ -11,7 +11,7 @@
 //
 // Inflating is `mgz`, which is this project's own gzip implementation used as a
 // package rather than copied in. zlib is DEFLATE with two bytes in front and a
-// checksum behind, so `inflate data 2` is the whole of it.
+// checksum behind, so `inflate_buf data 2` is the whole of it.
 //
 // Exports:
 //   is_png       data          -> bool
@@ -191,7 +191,7 @@ let palette = fn data ->
 // Every IDAT, in order, as one vec: the zlib stream is split across them at
 // arbitrary points, so this is not optional.
 let idat_bytes = fn data ->
-  let out = vec_new () in
+  let out = bytebuf_new 0 in
   let n = vec_len data in
   let rec walk = fn (pos: int) ->
     if pos + 8 > n then out
@@ -203,7 +203,7 @@ let idat_bytes = fn data ->
           if is_idat data (pos + 4) then
             let rec copy = fn (i: int) ->
               if i == len then ()
-              else let _ = vec_push out (vec_get data (pos + 8 + i)) in copy (i + 1) in
+              else let _ = bytebuf_push out (vec_get data (pos + 8 + i)) in copy (i + 1) in
             copy 0
           else () in
         walk (pos + 12 + len) in
@@ -341,12 +341,12 @@ let unfilter_at = fn raw -> fn (start: int) -> fn (colour: int) -> fn (depth: in
     if y == height then ()
     else
       let src = start + y * (pline + 1) in
-      let ft = vec_get raw src in
+      let ft = bytebuf_get raw src in
       let dst = y * pline in
       let rec col = fn (x: int) ->
         if x == pline then ()
         else
-          let cur = vec_get raw (src + 1 + x) in
+          let cur = bytebuf_get raw (src + 1 + x) in
           let left = if x >= fstep then bytebuf_get packed (dst + x - fstep) else 0 in
           let up = if y > 0 then bytebuf_get packed (dst - pline + x) else 0 in
           let upleft =
@@ -490,7 +490,9 @@ let decode = fn data ->
     let colour = vec_get h 3 in
     let _ = check_depth colour depth in
     // zlib: two bytes of header, then the DEFLATE stream mgz knows how to read.
-    let raw = inflate (idat_bytes data) 2 in
+    // `inflate_buf` hands back where the stream ended as well; the Adler-32
+    // after it is not checked here, as it was not before.
+    let (raw, _end) = inflate_buf (idat_bytes data) 2 in
     if vec_get h 4 == 1 then deinterlace raw colour depth width height
     else unfilter raw colour depth width height;
 
